@@ -423,8 +423,9 @@ def run_command(args: argparse.Namespace) -> int:
             # Fetch and process rules
             try:
                 rules = client.get_policy_rules(backend_url, tenant_key, policy_id)
-            except Exception:
-                continue
+            except Exception as exc:
+                summary["errors"].append(f"Blocking and Isolation collection failed for policy {policy_name} ({policy_id}): {exc}")
+                rules = []
             for rule in rules:
                 enriched_rule = dict(rule)
                 enriched_rule["policy_id"] = policy_id
@@ -434,7 +435,8 @@ def run_command(args: argparse.Namespace) -> int:
             if ngav_enabled:
                 try:
                     cp_rules = client.get_core_prevention_rules(backend_url, tenant_key, policy_id)
-                except Exception:
+                except Exception as exc:
+                    summary["errors"].append(f"Core Prevention collection failed for policy {policy_name} ({policy_id}): {exc}")
                     cp_rules = []
                 for rule in cp_rules:
                     enriched_rule = dict(rule)
@@ -578,8 +580,7 @@ def run_command(args: argparse.Namespace) -> int:
 
     if ngav_enabled:
         try:
-            cps_source = core_prevention_rules if core_prevention_rules else policy_rules
-            cps = summarize_core_prevention_settings(cps_source, policy_rules)
+            cps = summarize_core_prevention_settings(core_prevention_rules, policy_rules, policies)
             summary["checks"]["core_prevention_settings"] = {"status": "ok", "summary": cps}
         except Exception as exc:
             summary["checks"]["core_prevention_settings"] = {"status": "error"}

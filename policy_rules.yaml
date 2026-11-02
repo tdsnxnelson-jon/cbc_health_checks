@@ -9,7 +9,8 @@ review_practice:
 good:
   minimums:
     - "Use Test Rule before implementing rule changes in production"
-    - "Core prevention in Alert and block"
+    - "Every Core Prevention setting in Alert and Block, assessed per platform"
+    - "At least one enabled NAME_PATH file-path rule per policy; zero makes the policy WEAK"
   required_controls:
     known_malware:
       - "Runs or is running: DENY/TERMINATE"
@@ -42,7 +43,7 @@ best:
   minimums:
     - "Use Test Rule before implementing rule changes in production"
     - "Achieve better policy"
-    - "At least five policy path-based rules where rules.application.type = NAME_PATH"
+    - "At least five enabled path-based rules per policy where rules.application.type = NAME_PATH"
 
 gating_rules_to_keep:
   better_gate:
@@ -53,4 +54,4 @@ gating_rules_to_keep:
     - "No P2 BYPASS wildcard path rule issues"
     - "No monitor-heavy policy groups"
     - "No unreviewed policy drift"
-    - "At least five NAME_PATH path-based policy rules"
+    - "At least five enabled NAME_PATH path-based rules per policy"

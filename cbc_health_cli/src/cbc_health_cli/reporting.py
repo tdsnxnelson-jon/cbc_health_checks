@@ -22,12 +22,13 @@ _TABLE_HEADER_HEIGHT_IN = 0.26
 _TABLE_BODY_HEIGHT_IN = 0.21
 
 # Maximum rows that fit per table container height.
-EXEC_RECOMMENDATIONS_ROWS_ON_SLIDE = int((4.9 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
-EXEC_ISSUES_ROWS_ON_SLIDE = int((0.95 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
+EXEC_RECOMMENDATIONS_ROWS_ON_SLIDE = int((4.4 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
+EXEC_ISSUES_ROWS_ON_SLIDE = int((0.82 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
 TECH_CHECK_OUTCOMES_ROWS_ON_SLIDE = int((4.6 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
 TECH_WATCHLIST_ROWS_ON_SLIDE = int((3.7 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
-TECH_POLICY_EFFICACY_ROWS_ON_SLIDE = int((2.55 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
-TECH_RECOMMENDATIONS_ROWS_ON_SLIDE = int((5.8 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
+TECH_CORE_PREVENTION_ROWS_ON_SLIDE = int((2.25 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
+TECH_BLOCKING_COVERAGE_ROWS_ON_SLIDE = int((2.55 - 0.42) / 0.4)
+TECH_RECOMMENDATIONS_ROWS_ON_SLIDE = int((5.35 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
 
 APPENDIX_ROWS_PER_SLIDE_STANDARD = int((5.8 - _TABLE_HEADER_HEIGHT_IN) / _TABLE_BODY_HEIGHT_IN)
 APPENDIX_ROWS_PER_SLIDE_DENSE_TEXT = APPENDIX_ROWS_PER_SLIDE_STANDARD
@@ -735,6 +736,11 @@ def _add_table(
     table = table_shape.table
     _fit_column_widths(table, headers, rows, width)
     used_height = _compact_row_heights(table, height, len(rows))
+    if any("\n" in header for header in headers):
+        table.rows[0].height = Inches(0.42)
+        for row in list(table.rows)[1:]:
+            row.height = Inches(0.4)
+        used_height = 0.42 + 0.4 * len(rows)
     table_shape.height = Inches(used_height)
 
     for col_index, header in enumerate(headers):
@@ -1480,7 +1486,7 @@ def _is_policy_recommendation(rec: dict[str, Any]) -> bool:
         return False
     if "policy" in area:
         return True
-    return area in {"core prevention", "permissions rule audit"}
+    return area in {"core prevention", "blocking and isolation", "permissions rule audit"}
 
 
 def _recommendation_rows(recommendations: Any, *, policy_only: bool | None = None) -> list[list[Any]]:
@@ -2224,15 +2230,16 @@ def write_executive_pptx(run_dir: Path) -> Path:
         _add_section_header(
             slide,
             "Policy Analysis (Good/Better/Best)",
-            "High-level maturity view. Detailed policy actions are in the appendix.",
+            "Overall tier is based on strict gates; the distribution below shows assigned policies.",
         )
 
         current_tier = str(policy_tuning.get("current_tier", "unknown")).upper()
         score = policy_tuning.get("score_0_100", "n/a")
         review_cadence = str(policy_tuning.get("review_cadence", "quarterly_or_biannual")).replace("_", " ")
         policy_metrics = policy_tuning.get("metrics", {}) if isinstance(policy_tuning, dict) else {}
+        tier_counts = policy_metrics.get("scored_policy_maturity_tier_counts") if isinstance(policy_metrics, dict) else None
 
-        _add_card(slide, 0.65, 1.25, 2.9, 1.15, "Maturity Tier", current_tier, "framework status", accent="0F766E")
+        _add_card(slide, 0.65, 1.25, 2.9, 1.15, "Maturity Tier", current_tier, "strict gate status", accent="0F766E")
         _add_card(slide, 3.8, 1.25, 2.9, 1.15, "Policy Score", str(score), "0-100", accent="2563EB")
         _add_card(
             slide,
@@ -2246,6 +2253,12 @@ def write_executive_pptx(run_dir: Path) -> Path:
             accent="DC2626",
         )
         _add_card(slide, 10.1, 1.25, 2.55, 1.15, "Review Cadence", review_cadence, "recommended", accent="7C3AED", value_font_size_max=14)
+        if isinstance(tier_counts, dict):
+            tier_count_text = "Assigned policy tiers: " + " / ".join(
+                f"{_format_count(tier_counts.get(tier, 0))} {tier.upper()}"
+                for tier in ["weak", "good", "better", "best"]
+            )
+            _add_textbox(slide, 0.65, 2.43, 12.0, 0.18, tier_count_text, font_size=9, color=_hex_color("55606E"))
 
         gates = policy_tuning.get("gates", {}) if isinstance(policy_tuning, dict) else {}
         gate_rows: list[list[Any]] = []
@@ -2394,20 +2407,22 @@ def write_executive_pptx(run_dir: Path) -> Path:
         0.55,
         1.35,
         12.2,
-        4.9,
+        4.4,
         ["Priority", "Area", "Recommendation", "Evidence"],
         rec_rows or [["n/a", "n/a", "No recommendations were generated from the summary payload.", ""]],
     )
-    
-    recs_footnote = _add_sampling_footnote(slide, total_recs, shown_recs, y_position=6.35)
+
+    recommendation_footer_y = 5.77
+    recs_footnote = _add_sampling_footnote(slide, total_recs, shown_recs, y_position=recommendation_footer_y)
     if total_recs > shown_recs and recs_footnote is not None:
         pending_appendix_links.append((recs_footnote, "Detailed Recommendations (Page 1/"))
+        recommendation_footer_y += 0.23
 
     if policy_recommendation_rows:
         policy_footer = _add_textbox(
             slide,
             0.62,
-            6.15,
+            recommendation_footer_y,
             10.8,
             0.18,
             f"{len(policy_recommendation_rows)} policy recommendations are summarized here and detailed in the appendix. Click to open full policy recommendation list.",
@@ -2416,6 +2431,7 @@ def write_executive_pptx(run_dir: Path) -> Path:
             underline=True,
         )
         pending_appendix_links.append((policy_footer, "Policy Recommendations (Page 1/"))
+        recommendation_footer_y += 0.23
         _queue_appendix_table(
             policy_recommendation_rows,
             ["Priority", "Area", "Recommendation", "Evidence"],
@@ -2428,16 +2444,17 @@ def write_executive_pptx(run_dir: Path) -> Path:
         dormant_footer = _add_textbox(
             slide,
             0.62,
-            7.0,
-            8.5,
+            recommendation_footer_y,
+            10.8,
             0.18,
-            f"Showing {shown_dormant_users} of {total_dormant_users} dormant users from Evidence. Click to open appendix full list.",
+            f"Open appendix for the full list of {total_dormant_users} dormant users.",
             font_size=8,
             color=_hex_color("2563EB"),
             underline=True,
         )
         pending_appendix_links.append((dormant_footer, f"{dormant_title} (Page 1/"))
         _queue_appendix_table(dormant_rows, dormant_headers, dormant_title)
+        recommendation_footer_y += 0.23
 
     errors = summary.get("errors", [])
     warnings = summary.get("warnings", [])
@@ -2450,29 +2467,30 @@ def write_executive_pptx(run_dir: Path) -> Path:
             issue_rows.append(["Warning", message])
 
     issue_rows_to_show = issue_rows[:EXEC_ISSUES_ROWS_ON_SLIDE]
-    _add_table(
-        slide,
-        0.55,
-        6.35,
-        12.2,
-        0.95,
-        ["Type", "Message"],
-        issue_rows_to_show or [["Info", "No run errors or warnings were captured in summary.json."]],
-    )
-    if len(issue_rows) > len(issue_rows_to_show):
-        issues_footer = _add_textbox(
+    if issue_rows:
+        _add_table(
             slide,
-            0.62,
-            7.18,
-            7.6,
-            0.18,
-            f"Showing {len(issue_rows_to_show)} of {len(issue_rows)} issues. Click to open appendix full list.",
-            font_size=8,
-            color=_hex_color("2563EB"),
-            underline=True,
+            0.55,
+            6.67,
+            12.2,
+            0.82,
+            ["Run Issue Type", "Details"],
+            issue_rows_to_show,
         )
-        pending_appendix_links.append((issues_footer, "Run Issues (Page 1/"))
-        _queue_appendix_table(issue_rows, ["Type", "Message"], "Run Issues")
+        if len(issue_rows) > len(issue_rows_to_show):
+            issues_footer = _add_textbox(
+                slide,
+                0.62,
+                recommendation_footer_y,
+                10.8,
+                0.18,
+                f"Open appendix for all {len(issue_rows)} run errors and warnings.",
+                font_size=8,
+                color=_hex_color("2563EB"),
+                underline=True,
+            )
+            pending_appendix_links.append((issues_footer, "Run Issues (Page 1/"))
+            _queue_appendix_table(issue_rows, ["Run Issue Type", "Details"], "Run Issues")
     
     # Add pagination slides for full recommendation list if needed
     if total_recs > shown_recs:
@@ -3185,15 +3203,16 @@ def write_technical_pptx(run_dir: Path) -> Path:
         _add_section_header(
             slide,
             "Policy Analysis (Good/Better/Best)",
-            "High-level maturity checkpoint in the policy section. Full policy actions live in the appendix.",
+            "Overall tier is based on strict gates; the distribution below shows assigned policies.",
         )
 
         current_tier = str(policy_tuning.get("current_tier", "unknown")).upper()
         score = policy_tuning.get("score_0_100", "n/a")
         review_cadence = str(policy_tuning.get("review_cadence", "quarterly_or_biannual")).replace("_", " ")
         policy_metrics = policy_tuning.get("metrics", {}) if isinstance(policy_tuning, dict) else {}
+        tier_counts = policy_metrics.get("scored_policy_maturity_tier_counts") if isinstance(policy_metrics, dict) else None
 
-        _add_card(slide, 0.65, 1.2, 2.75, 1.2, "Maturity Tier", current_tier, "framework status", accent="0F766E")
+        _add_card(slide, 0.65, 1.2, 2.75, 1.2, "Maturity Tier", current_tier, "strict gate status", accent="0F766E")
         _add_card(slide, 3.55, 1.2, 2.75, 1.2, "Policy Score", str(score), "0-100", accent="2563EB")
         _add_card(
             slide,
@@ -3207,6 +3226,12 @@ def write_technical_pptx(run_dir: Path) -> Path:
             accent="DC2626",
         )
         _add_card(slide, 9.35, 1.2, 3.3, 1.2, "Review Cadence", review_cadence, "recommended", accent="7C3AED", value_font_size_max=14)
+        if isinstance(tier_counts, dict):
+            tier_count_text = "Assigned policy tiers: " + " / ".join(
+                f"{_format_count(tier_counts.get(tier, 0))} {tier.upper()}"
+                for tier in ["weak", "good", "better", "best"]
+            )
+            _add_textbox(slide, 0.65, 2.47, 12.0, 0.18, tier_count_text, font_size=9, color=_hex_color("55606E"))
 
         gates = policy_tuning.get("gates", {}) if isinstance(policy_tuning, dict) else {}
         gate_rows: list[list[Any]] = []
@@ -3490,7 +3515,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "F8FAFC")
-    _add_section_header(slide, "Detailed Breakdown", "Top-risk lists that usually matter during engineering review.")
+    _add_section_header(slide, "Detailed Breakdown", "Core Prevention modes and Blocking and Isolation coverage, with weakest policies first.")
     risk_metric_data = {
         "Old banned hashes": _to_numeric(banned_hashes.get("older_than_365d", 0)),
         "Bypass rules": _to_numeric(permissions_rule_audit.get("bypass_rules", 0)),
@@ -3510,27 +3535,66 @@ def write_technical_pptx(run_dir: Path) -> Path:
         series_name="Count",
     )
 
-    policy_breakdown = policy_efficacy.get("policy_group_breakdown", []) if isinstance(policy_efficacy, dict) else []
-    if _org_defense_rules_disabled(summary):
+    blocking_applicable = (
+        not _org_defense_rules_disabled(summary)
+        and policy_posture.get("ngav_enabled", True)
+        and policy_tuning.get("framework_applicable", True)
+    )
+    policy_breakdown = [
+        item for item in policy_tuning.get("policy_maturity_action_plan_all", [])
+        if isinstance(item, dict) and "enforcement_score_0_100" in item
+        and "blocking_isolation_rule_counts" in item and "core_prevention_alert" in item
+    ] if blocking_applicable else []
+    core_headers = ["Policy", "Alert", "Alert and Block", "Unknown"]
+    blocking_headers = ["Policy", "Known\nmalware", "Banned\nlist", "Unknown\napp", "Adware/\nPUP", "Suspected\nmalware", "File\npaths", "Assessment"]
+    core_rows = [
+        [item.get("policy_name", "unknown"), item.get("core_prevention_alert", 0),
+         item.get("core_prevention_alert_and_block", 0), item.get("core_prevention_unknown", 0)]
+        for item in policy_breakdown if isinstance(item, dict)
+    ]
+    blocking_rows: list[list[Any]] = []
+    core_detail_rows: list[list[Any]] = []
+    for item in policy_breakdown:
+        if not isinstance(item, dict):
+            continue
+        counts = item.get("blocking_isolation_rule_counts", {})
+        assessment = str(item.get("current_tier", "unknown")).upper()
+        if item.get("missing_critical_controls"):
+            assessment = "CRITICAL / " + assessment
+        blocking_rows.append([
+            item.get("policy_name", "unknown"),
+            *[counts.get(control, 0) for control in (
+                "known_malware", "company_banned_list", "unknown_application", "adware_pup", "suspected_malware"
+            )],
+            item.get("file_path_rules", 0),
+            f"{assessment}\n{item.get('enforcement_score_0_100', 'n/a')}/100",
+        ])
+        for detail in item.get("core_prevention_details", []):
+            core_detail_rows.append([
+                item.get("policy_name", "unknown"), detail.get("name", "unknown"),
+                detail.get("platform", "unknown"), detail.get("mode", "unknown"),
+            ])
+
+    if not blocking_applicable:
         _add_eedr_not_applicable(slide, 5.0, 1.35, 7.7, 2.35, "Blocking-rule analysis")
     else:
-        policy_blocks: dict[str, float] = {}
-        for item in policy_breakdown[:12]:
-            if isinstance(item, dict):
-                policy_blocks[str(item.get("policy_name", "unknown"))] = _to_numeric(item.get("block_rules", 0))
-        policy_items = _sorted_mapping_items(policy_blocks, limit=8, sort_by_value=True)
-        _add_column_chart(
-            slide,
-            5.0,
-            1.35,
-            7.7,
-            2.35,
-            "Policies with Highest Blocking Rules",
-            [name for name, _ in policy_items],
-            [value for _, value in policy_items],
-            series_name="Block rules",
-            show_data_labels=False,
+        _add_textbox(slide, 5.0, 1.12, 7.7, 0.22, "Core Prevention - settings per platform", font_size=11)
+        _add_table(
+            slide, 5.0, 1.4, 7.7, 2.25, core_headers,
+            core_rows[:TECH_CORE_PREVENTION_ROWS_ON_SLIDE] or [["No policy assessment data; rerun checks", "-", "-", "-"]],
         )
+        _queue_appendix_table(core_rows, core_headers, "Core Prevention by Policy")
+        _queue_appendix_table(
+            core_detail_rows, ["Policy", "Setting\nname", "Platform", "Mode"],
+            "Core Prevention Settings", rows_per_slide=12,
+        )
+        if core_rows:
+            core_link = _add_textbox(
+                slide, 5.0, 3.55, 7.7, 0.16,
+                f"Showing {min(len(core_rows), TECH_CORE_PREVENTION_ROWS_ON_SLIDE)} of {len(core_rows)} policies. Open full Core Prevention coverage.",
+                font_size=8, color=_hex_color("2563EB"), underline=True,
+            )
+            pending_appendix_links.append((core_link, "Core Prevention by Policy (Page 1/"))
 
     _add_textbox(
         slide,
@@ -3538,33 +3602,33 @@ def write_technical_pptx(run_dir: Path) -> Path:
         3.72,
         12.0,
         0.22,
-        "Table purpose: per-policy enforcement mix (Monitor vs Block). Ratio = Monitor / (Monitor + Block + Unknown).",
+        "Blocking and Isolation: active enforcing rules per category (no Alert-only mode). Missing malware/banned rules = CRITICAL; no file paths = WEAK.",
         font_size=10,
         color=_hex_color("55606E"),
     )
 
-    policy_breakdown = policy_efficacy.get("policy_group_breakdown", []) if isinstance(policy_efficacy, dict) else []
-    full_policy_rows = _rows_from_list(policy_breakdown, ["policy_name", "monitor_rules", "block_rules", "monitor_ratio"])
-    policy_rows_on_slide = _rows_from_list(
-        policy_breakdown,
-        ["policy_name", "monitor_rules", "block_rules", "monitor_ratio"],
-        TECH_POLICY_EFFICACY_ROWS_ON_SLIDE,
-    )
-    total_policies = len([p for p in policy_breakdown if isinstance(p, dict)]) if isinstance(policy_breakdown, list) else 0
+    policy_rows_on_slide = blocking_rows[:TECH_BLOCKING_COVERAGE_ROWS_ON_SLIDE]
+    total_policies = len(blocking_rows)
     shown_policies = len(policy_rows_on_slide)
     
-    _add_table(slide, 0.65, 4.0, 12.0, 2.55, ["Policy", "Monitor", "Block", "Ratio"], policy_rows_on_slide)
+    if not blocking_applicable:
+        _add_eedr_not_applicable(slide, 0.65, 4.0, 12.0, 2.55, "Blocking and Isolation coverage")
+    else:
+        _add_table(
+            slide, 0.65, 4.0, 12.0, 2.55, blocking_headers,
+            policy_rows_on_slide or [["No policy assessment data; rerun checks", "-", "-", "-", "-", "-", "-", "Unknown"]],
+        )
     
     policy_footnote = _add_sampling_footnote(slide, total_policies, shown_policies, y_position=6.73)
     
-    # Add pagination slides for full policy breakdown if needed
     if total_policies > shown_policies:
         if policy_footnote is not None:
-            pending_appendix_links.append((policy_footnote, "Policy Efficacy Details (Page 1/"))
+            pending_appendix_links.append((policy_footnote, "Blocking and Isolation by Policy (Page 1/"))
         _queue_appendix_table(
-            full_policy_rows,
-            ["Policy", "Monitor", "Block", "Ratio"],
-            "Policy Efficacy Details",
+            blocking_rows,
+            blocking_headers,
+            "Blocking and Isolation by Policy",
+            rows_per_slide=12,
         )
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -3587,15 +3651,19 @@ def write_technical_pptx(run_dir: Path) -> Path:
     total_recs_tech = len([r for r in recommendations if isinstance(r, dict)]) if isinstance(recommendations, list) else 0
     shown_recs_tech = len(rec_rows)
     
-    _add_table(slide, 0.55, 1.25, 12.2, 5.8, ["Priority", "Area", "Recommendation", "Evidence"], rec_rows or [["n/a", "n/a", "No recommendations were generated.", ""]])
+    _add_table(slide, 0.55, 1.25, 12.2, 5.35, ["Priority", "Area", "Recommendation", "Evidence"], rec_rows or [["n/a", "n/a", "No recommendations were generated.", ""]])
     
-    recs_footnote = _add_sampling_footnote(slide, total_recs_tech, shown_recs_tech, y_position=7.18)
+    recommendation_footer_y_tech = 6.63
+    recs_footnote = _add_sampling_footnote(slide, total_recs_tech, shown_recs_tech, y_position=recommendation_footer_y_tech)
+    if recs_footnote is not None:
+        pending_appendix_links.append((recs_footnote, "Complete Recommendations (Page 1/"))
+        recommendation_footer_y_tech += 0.23
 
     if policy_recommendation_rows_tech:
         policy_footer_tech = _add_textbox(
             slide,
             0.62,
-            7.0,
+            recommendation_footer_y_tech,
             10.8,
             0.18,
             f"{len(policy_recommendation_rows_tech)} policy recommendations are in the appendix. Click to open the full policy recommendation table.",
@@ -3604,6 +3672,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
             underline=True,
         )
         pending_appendix_links.append((policy_footer_tech, "Policy Recommendations (Page 1/"))
+        recommendation_footer_y_tech += 0.23
         _queue_appendix_table(
             policy_recommendation_rows_tech,
             ["Priority", "Area", "Recommendation", "Evidence"],
@@ -3616,21 +3685,20 @@ def write_technical_pptx(run_dir: Path) -> Path:
         dormant_footer = _add_textbox(
             slide,
             0.62,
-            6.98,
-            8.5,
+            recommendation_footer_y_tech,
+            10.8,
             0.18,
-            f"Showing {shown_dormant_users} of {total_dormant_users} dormant users from Evidence. Click to open appendix full list.",
+            f"Open appendix for the full list of {total_dormant_users} dormant users.",
             font_size=8,
             color=_hex_color("2563EB"),
             underline=True,
         )
         pending_appendix_links.append((dormant_footer, f"{dormant_title} (Page 1/"))
         _queue_appendix_table(dormant_rows, dormant_headers, dormant_title)
+        recommendation_footer_y_tech += 0.23
 
     # Add pagination slides for full recommendation list if needed
     if total_recs_tech > shown_recs_tech:
-        if recs_footnote is not None:
-            pending_appendix_links.append((recs_footnote, "Complete Recommendations (Page 1/"))
         _queue_appendix_table(
             full_rec_rows_tech,
             ["Priority", "Area", "Recommendation", "Evidence"],

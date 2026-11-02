@@ -41,6 +41,11 @@ REQUIRED_BLOCKING_CONTROLS: dict[str, dict[str, Any]] = {
     },
 }
 
+BASELINE_BLOCKING_CONTROLS = tuple(
+    control for control in REQUIRED_BLOCKING_CONTROLS if control != "not_listed_application"
+)
+CRITICAL_BLOCKING_CONTROLS = ("known_malware", "company_banned_list")
+
 MINIMUM_BEHAVIOR_REQUIREMENTS: tuple[dict[str, Any], ...] = (
     {
         "id": "ransomware_like_behavior",
@@ -172,15 +177,40 @@ def _normalize_action(rule: dict[str, Any]) -> str:
                 "unknown",
             )
 
-    action = str(raw).upper().strip()
+    action = str(raw).upper().strip().replace(" ", "_")
     if action in {"REPORT", "DETECT", "MONITOR_ONLY", "ALERT_ONLY"}:
         return "MONITOR"
-    if action in {"PREVENT", "ENFORCE", "BLOCK_AND_REPORT"}:
+    if action in {"PREVENT", "ENFORCE", "BLOCK_AND_REPORT", "ALERT_AND_BLOCK", "ALERT_&_BLOCK"}:
         return "BLOCK"
     # Some permission rules use action=IGNORE with operation=BYPASS_ALL.
     if "BYPASS" in str(op_raw).upper() or "BYPASS" in action:
         return "BYPASS"
     return action
+
+
+def _rule_enforces(rule: dict[str, Any]) -> bool:
+    return (
+        _to_bool(_pick_value(rule, ["is_enabled", "enabled", "isEnabled"], True)) is not False
+        and not any(_to_bool(rule.get(key)) is True for key in ("test", "is_test", "test_mode"))
+        and _normalize_action(rule) in BLOCK_ACTIONS
+    )
+
+
+def _core_prevention_modes(rule: dict[str, Any]) -> list[tuple[str, str]]:
+    params = rule.get("parameters")
+    if isinstance(params, dict):
+        modes = [
+            (platform, _normalize_action({"action": params[key]}))
+            for platform, key in (
+                ("Windows", "WindowsAssignmentMode"),
+                ("Linux", "LinuxAssignmentMode"),
+                ("Mac", "MacAssignmentMode"),
+            )
+            if key in params
+        ]
+        if modes:
+            return modes
+    return [("All", _normalize_action(rule))]
 
 
 def _extract_rule_text(rule: dict[str, Any]) -> str:
@@ -662,6 +692,7 @@ def summarize_policy_posture(
     enabled_rules = 0
     blocking_rules = 0
     path_based_policy_rules = 0
+    path_based_policy_rules_by_policy: Counter[str] = Counter()
     action_counter: Counter[str] = Counter()
 
     for rule in rules:
@@ -675,8 +706,10 @@ def summarize_policy_posture(
             app_type = str(_pick_value(application, ["type", "application_type", "app_type"], "")).strip().upper()
         if not app_type:
             app_type = str(_pick_value(rule, ["application_type", "app_type", "rule_application_type"], "")).strip().upper()
-        if app_type == "NAME_PATH":
+        if app_type == "NAME_PATH" and _to_bool(enabled_raw) is not False:
             path_based_policy_rules += 1
+            policy_id = str(_pick_value(rule, ["policy_id", "policyId"], "unknown"))
+            path_based_policy_rules_by_policy[policy_id] += 1
 
         action = _normalize_action(rule)
         action_counter[action] += 1
@@ -701,6 +734,7 @@ def summarize_policy_posture(
         "blocking_rules": blocking_rules,
         "blocking_rule_ratio": round(blocking_rule_ratio, 4),
         "path_based_policy_rules": path_based_policy_rules,
+        "path_based_policy_rules_by_policy": dict(path_based_policy_rules_by_policy),
         "ngav_enabled": ngav_enabled,
         "policy_type_breakdown": dict(policy_type_counter),
         "rule_action_breakdown": dict(action_counter.most_common(10)),
@@ -1334,6 +1368,7 @@ def summarize_policy_settings(policies: list[dict[str, Any]], data_collection_co
 def summarize_core_prevention_settings(
     core_prevention_rules: list[dict[str, Any]],
     policy_rules_for_required_controls: list[dict[str, Any]] | None = None,
+    policies: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     by_category: dict[str, dict[str, int]] = defaultdict(lambda: {"monitor": 0, "block": 0, "unknown": 0})
     by_policy: dict[str, dict[str, Any]] = defaultdict(
@@ -1345,31 +1380,38 @@ def summarize_core_prevention_settings(
             "categories": set(),
             "required_controls": {},
             "minimum_behavior_controls": defaultdict(set),
+            "core_prevention_details": [],
+            "blocking_isolation_rule_counts": Counter(),
         }
     )
+
+    for policy in policies or []:
+        policy_id = str(_pick_value(policy, ["id", "policy_id"], "unknown"))
+        by_policy[policy_id]["policy_name"] = str(policy.get("name", "unknown"))
 
     for rule in core_prevention_rules:
         category = str(_pick_value(rule, ["category", "type", "name"], "uncategorized"))
         policy_id = str(_pick_value(rule, ["policy_id", "policyId"], "unknown"))
         policy_name = str(_pick_value(rule, ["policy_name", "policyName"], "unknown"))
-        action = _normalize_action(rule)
-
         policy_bucket = by_policy[policy_id]
         if policy_name:
             policy_bucket["policy_name"] = policy_name
         policy_bucket["categories"].add(category)
 
-        if action in BLOCK_ACTIONS:
-            by_category[category]["block"] += 1
-            policy_bucket["block"] += 1
-        elif action in MONITOR_ACTIONS:
-            by_category[category]["monitor"] += 1
-            policy_bucket["monitor"] += 1
-        else:
-            by_category[category]["unknown"] += 1
-            policy_bucket["unknown"] += 1
+        enabled = _to_bool(_pick_value(rule, ["is_enabled", "enabled", "isEnabled"], True)) is not False
+        for platform, action in _core_prevention_modes(rule):
+            mode = "block" if action in BLOCK_ACTIONS else "monitor" if action in MONITOR_ACTIONS else "unknown"
+            if not enabled:
+                mode = "unknown"
+            by_category[category][mode] += 1
+            policy_bucket[mode] += 1
+            policy_bucket["core_prevention_details"].append({
+                "name": str(_pick_value(rule, ["name", "rule_name", "id"], category)),
+                "platform": platform,
+                "mode": {"block": "Alert and Block", "monitor": "Alert", "unknown": "Unknown/disabled"}[mode],
+            })
 
-    required_control_rules = policy_rules_for_required_controls if policy_rules_for_required_controls is not None else core_prevention_rules
+    required_control_rules = policy_rules_for_required_controls or []
     for rule in required_control_rules:
         matched_control = _match_required_blocking_control(rule)
         if not matched_control:
@@ -1381,9 +1423,9 @@ def summarize_core_prevention_settings(
         if policy_name:
             policy_bucket["policy_name"] = policy_name
 
-        action = _normalize_action(rule)
-        if action in BLOCK_ACTIONS:
+        if _rule_enforces(rule):
             policy_bucket["required_controls"][matched_control] = "block"
+            policy_bucket["blocking_isolation_rule_counts"][matched_control] += 1
             if (
                 matched_control in GOOD_MINIMUM_BEHAVIOR_REQUIREMENTS_BY_CONTROL
                 or matched_control in BETTER_MINIMUM_BEHAVIOR_REQUIREMENTS_BY_CONTROL
@@ -1392,12 +1434,6 @@ def summarize_core_prevention_settings(
                 if matched_behaviors:
                     behavior_bucket = policy_bucket["minimum_behavior_controls"].setdefault(matched_control, set())
                     behavior_bucket.update(matched_behaviors)
-        elif action in MONITOR_ACTIONS:
-            if policy_bucket["required_controls"].get(matched_control) != "block":
-                policy_bucket["required_controls"][matched_control] = "monitor"
-        else:
-            if matched_control not in policy_bucket["required_controls"]:
-                policy_bucket["required_controls"][matched_control] = "unknown"
 
     alert_only_categories: list[str] = []
     for category, counts in by_category.items():
@@ -1413,8 +1449,8 @@ def summarize_core_prevention_settings(
         total = counts["monitor"] + counts["block"] + counts["unknown"]
         required_controls = counts.get("required_controls", {})
         missing_required = [
-            metadata["label"]
-            for control_id, metadata in REQUIRED_BLOCKING_CONTROLS.items()
+            REQUIRED_BLOCKING_CONTROLS[control_id]["label"]
+            for control_id in BASELINE_BLOCKING_CONTROLS
             if required_controls.get(control_id) != "block"
         ]
         minimum_behavior_controls = counts.get("minimum_behavior_controls", {})
@@ -1454,6 +1490,16 @@ def summarize_core_prevention_settings(
             "unknown_rules": counts["unknown"],
             "monitor_ratio": round((counts["monitor"] / total), 4) if total else 0.0,
             "categories": sorted(counts["categories"]),
+            "core_prevention_details": counts["core_prevention_details"],
+            "blocking_isolation_rule_counts": {
+                control: counts["blocking_isolation_rule_counts"][control]
+                for control in BASELINE_BLOCKING_CONTROLS
+            },
+            "missing_critical_controls": [
+                REQUIRED_BLOCKING_CONTROLS[control]["label"]
+                for control in CRITICAL_BLOCKING_CONTROLS
+                if required_controls.get(control) != "block"
+            ],
             "missing_required_controls": missing_required,
             "missing_required_controls_count": len(missing_required),
             "missing_minimum_behavior_controls": missing_minimum_behavior_controls,
@@ -1470,7 +1516,7 @@ def summarize_core_prevention_settings(
             fully_alert_only_policies.append(row)
         if missing_required:
             policies_with_missing_required_controls.append(row)
-        if counts["monitor"] > 0 or missing_required:
+        if counts["monitor"] > 0 or counts["unknown"] > 0 or total == 0 or missing_required:
             policies_with_enforcement_gaps.append(row)
 
     policy_mode_breakdown.sort(
@@ -1522,7 +1568,7 @@ def summarize_core_prevention_settings(
         "total_categories": len(by_category),
         "alert_only_categories": sorted(alert_only_categories),
         "total_policies": len(policy_mode_breakdown),
-        "required_blocking_controls": [metadata["label"] for metadata in REQUIRED_BLOCKING_CONTROLS.values()],
+        "required_blocking_controls": [REQUIRED_BLOCKING_CONTROLS[control]["label"] for control in BASELINE_BLOCKING_CONTROLS],
         "minimum_behavior_requirements": [
             requirement["label"] for requirement in MINIMUM_BEHAVIOR_REQUIREMENTS
         ],
@@ -2843,7 +2889,8 @@ def summarize_policy_tuning_analysis(
             if _policy_assigned_endpoints(policy) > 0:
                 assigned_policy_ids.add(pid)
 
-    use_assigned_scope = bool(assigned_policy_ids)
+    has_policy_data = isinstance(policies, list) and any(isinstance(policy, dict) for policy in policies)
+    use_assigned_scope = has_policy_data
 
     def _count_scoped(records: Any) -> int:
         if not isinstance(records, list):
@@ -2893,7 +2940,7 @@ def summarize_policy_tuning_analysis(
             total_rules_scored += _to_int(row.get("monitor_rules", 0))
             total_rules_scored += _to_int(row.get("block_rules", 0))
             total_rules_scored += _to_int(row.get("unknown_rules", 0))
-    if total_rules_scored <= 0:
+    if total_rules_scored <= 0 and not use_assigned_scope:
         total_rules_scored = int(policy_posture.get("total_rules", 0))
 
     fully_alert_only_count_all = len(core_prevention.get("fully_alert_only_policies", []) or [])
@@ -2932,57 +2979,34 @@ def summarize_policy_tuning_analysis(
     else:
         drift_detected = drift_detected_all
 
-    good_pass = (
-        total_rules_scored > 0
-        and fully_alert_only_count == 0
-        and missing_required_count == 0
-        and missing_minimum_behavior_count == 0
-    )
-
     monitor_heavy_ratio = (monitor_heavy_count / total_policies_scored) if total_policies_scored > 0 else 0.0
-    better_pass = (
-        good_pass
-        and missing_better_minimum_behavior_count == 0
-        and p1_bypass_count == 0
-        and monitor_heavy_ratio <= 0.2
-    )
-
-    path_based_policy_rules = _to_int(policy_posture.get("path_based_policy_rules", 0))
-    best_pass = (
-        better_pass
-        and p2_bypass_count == 0
-        and monitor_heavy_count == 0
-        and not drift_detected
-        and path_based_policy_rules >= 5
-    )
-
-    if best_pass:
-        current_tier = "best"
-    elif better_pass:
-        current_tier = "better"
-    elif good_pass:
-        current_tier = "good"
+    path_based_policy_rules_all = _to_int(policy_posture.get("path_based_policy_rules", 0))
+    path_based_policy_rules_by_policy = policy_posture.get("path_based_policy_rules_by_policy", {})
+    if not isinstance(path_based_policy_rules_by_policy, dict):
+        path_based_policy_rules_by_policy = {}
+    if use_assigned_scope:
+        path_based_policy_rules = sum(
+            _to_int(path_based_policy_rules_by_policy.get(pid, 0)) for pid in assigned_policy_ids
+        )
     else:
-        current_tier = "weak"
-
+        path_based_policy_rules = path_based_policy_rules_all
     # Normalize penalties by assigned-policy scope so the score degrades
     # proportionally instead of collapsing to zero in medium-size tenants.
     policy_scope = max(total_policies_scored, 1)
-    score = 100.0
-    score -= min(25.0, 25.0 * (fully_alert_only_count / policy_scope))
-    score -= min(25.0, 25.0 * (missing_required_count / policy_scope))
-    score -= min(20.0, 20.0 * (missing_minimum_behavior_count / policy_scope))
-    score -= min(10.0, 10.0 * (missing_better_minimum_behavior_count / policy_scope))
-    score -= min(12.0, 12.0 * (p1_bypass_count / policy_scope))
-    score -= min(8.0, 8.0 * (p2_bypass_count / policy_scope))
+    gap_score = 100.0
+    gap_score -= min(25.0, 25.0 * (fully_alert_only_count / policy_scope))
+    gap_score -= min(25.0, 25.0 * (missing_required_count / policy_scope))
+    gap_score -= min(20.0, 20.0 * (missing_minimum_behavior_count / policy_scope))
+    gap_score -= min(10.0, 10.0 * (missing_better_minimum_behavior_count / policy_scope))
+    gap_score -= min(12.0, 12.0 * (p1_bypass_count / policy_scope))
+    gap_score -= min(8.0, 8.0 * (p2_bypass_count / policy_scope))
     if path_based_policy_rules < 5:
-        score -= min(8.0, 8.0 * ((5 - path_based_policy_rules) / 5.0))
+        gap_score -= min(8.0, 8.0 * ((5 - path_based_policy_rules) / 5.0))
     if monitor_heavy_ratio > 0.2:
-        score -= min(12.0, 12.0 * ((monitor_heavy_ratio - 0.2) / 0.8))
+        gap_score -= min(12.0, 12.0 * ((monitor_heavy_ratio - 0.2) / 0.8))
     if drift_detected:
-        score -= 5.0
-    score = max(min(score, 100.0), 0.0)
-    score = int(round(score))
+        gap_score -= 5.0
+    gap_score = int(round(max(min(gap_score, 100.0), 0.0)))
 
     top_gaps: list[str] = []
     next_actions: list[str] = []
@@ -2992,7 +3016,7 @@ def summarize_policy_tuning_analysis(
         next_actions.append("Use Test Rule first, then move alert-only controls to DENY/TERMINATE where business impact is acceptable")
     if missing_required_count_all > 0:
         top_gaps.append(f"{missing_required_count_all} policies are missing one or more required block controls across all policies")
-        next_actions.append("Use Test Rule and close required control gaps for known malware, suspected malware, adware/PUP, unknown, and not listed app controls")
+        next_actions.append("Use Test Rule and close Blocking and Isolation gaps for Known malware, company banned list, Unknown application/process, Adware/PUP, and Suspected malware")
     if missing_minimum_behavior_count_all > 0:
         top_gaps.append(
             f"{missing_minimum_behavior_count_all} policies are missing GOOD minimum behavior controls for Unknown or Not Listed app categories"
@@ -3126,15 +3150,26 @@ def summarize_policy_tuning_analysis(
     def _next_level_plan(pid: str) -> dict[str, Any]:
         mode_row = mode_by_policy_id.get(pid, {})
         efficacy_row = efficacy_by_policy_id.get(pid, {})
+        policy_path_based_rules = _to_int(
+            path_based_policy_rules_by_policy.get(pid, 0)
+        )
 
-        monitor_rules = _to_int(mode_row.get("monitor_rules", efficacy_row.get("monitor_rules", 0)))
-        block_rules = _to_int(mode_row.get("block_rules", efficacy_row.get("block_rules", 0)))
-        unknown_rules = _to_int(mode_row.get("unknown_rules", efficacy_row.get("unknown_rules", 0)))
+        monitor_rules = _to_int(mode_row.get("monitor_rules", 0))
+        block_rules = _to_int(mode_row.get("block_rules", 0))
+        unknown_rules = _to_int(mode_row.get("unknown_rules", 0))
         total_rules = monitor_rules + block_rules + unknown_rules
-        missing_required_controls_count = _to_int(mode_row.get("missing_required_controls_count", 0))
-        missing_required_controls = mode_row.get("missing_required_controls", [])
-        if not isinstance(missing_required_controls, list):
-            missing_required_controls = []
+        blocking_counts = mode_row.get("blocking_isolation_rule_counts", {})
+        missing_required_controls = [
+            REQUIRED_BLOCKING_CONTROLS[control]["label"]
+            for control in BASELINE_BLOCKING_CONTROLS
+            if _to_int(blocking_counts.get(control, 0)) == 0
+        ]
+        missing_required_controls_count = len(missing_required_controls)
+        missing_critical_controls = [
+            REQUIRED_BLOCKING_CONTROLS[control]["label"]
+            for control in CRITICAL_BLOCKING_CONTROLS
+            if _to_int(blocking_counts.get(control, 0)) == 0
+        ]
         missing_minimum_behavior_controls_count = _to_int(mode_row.get("missing_minimum_behavior_controls_count", 0))
         missing_minimum_behavior_controls = mode_row.get("missing_minimum_behavior_controls", [])
         if not isinstance(missing_minimum_behavior_controls, list):
@@ -3145,15 +3180,24 @@ def summarize_policy_tuning_analysis(
         missing_better_minimum_behavior_controls = mode_row.get("missing_better_minimum_behavior_controls", [])
         if not isinstance(missing_better_minimum_behavior_controls, list):
             missing_better_minimum_behavior_controls = []
-        monitor_ratio_policy = float(efficacy_row.get("monitor_ratio", mode_row.get("monitor_ratio", 0.0)) or 0.0)
+        monitor_ratio_policy = monitor_rules / total_rules if total_rules else 0.0
         has_p1 = pid in p1_policy_ids
         has_p2 = pid in p2_policy_ids
         is_drifted = pid in drifted_policy_ids
-        fully_alert_only = monitor_rules > 0 and block_rules == 0
+        core_fully_blocking = total_rules > 0 and block_rules == total_rules
+        enforcement_score = 100.0
+        enforcement_score -= 30 * len(missing_critical_controls)
+        enforcement_score -= 5 * (missing_required_controls_count - len(missing_critical_controls))
+        enforcement_score -= 20 * (1 - block_rules / total_rules) if total_rules else 20
+        if policy_path_based_rules == 0:
+            enforcement_score = min(enforcement_score - 5, 59)
+        if missing_critical_controls:
+            enforcement_score = min(enforcement_score, 39)
+        enforcement_score = int(round(max(enforcement_score, 0)))
 
         good_gate = (
-            total_rules > 0
-            and (not fully_alert_only)
+            core_fully_blocking
+            and policy_path_based_rules > 0
             and missing_required_controls_count == 0
             and missing_minimum_behavior_controls_count == 0
         )
@@ -3168,7 +3212,7 @@ def summarize_policy_tuning_analysis(
             and (not has_p2)
             and monitor_rules == 0
             and (not is_drifted)
-            and path_based_policy_rules >= 5
+            and policy_path_based_rules >= 5
         )
 
         if best_gate:
@@ -3187,7 +3231,7 @@ def summarize_policy_tuning_analysis(
                 actions.append("Use Test Rule to validate residual monitor-only rules, then convert validated high-risk behavior to DENY/TERMINATE")
             if is_drifted:
                 actions.append("Review and approve drifted policy changes before promotion to BEST")
-            if path_based_policy_rules < 5:
+            if policy_path_based_rules < 5:
                 actions.append("Add at least five path-based policy rules (application.type = NAME_PATH) to satisfy BEST minimum criteria")
             if not actions:
                 actions.append("Sustain BETTER controls and tighten residual monitor behavior to reach BEST")
@@ -3215,9 +3259,13 @@ def summarize_policy_tuning_analysis(
             next_target = "good"
             actions = []
             if total_rules <= 0:
-                actions.append("Define baseline prevention rules for this policy")
-            if fully_alert_only:
-                actions.append("Run Test Rule on current monitor-only behaviors, then convert validated high-risk operations to DENY/TERMINATE")
+                actions.append("Collect and configure Core Prevention settings; missing settings cannot demonstrate enforcement")
+            elif not core_fully_blocking:
+                actions.append("Validate Core Prevention settings on a pilot group, then change Alert settings to Alert and Block and resolve unknown/disabled settings")
+            if policy_path_based_rules == 0:
+                actions.append("Add scoped file-path rules (application.type = NAME_PATH); zero file-path rules makes this policy WEAK")
+            if missing_critical_controls:
+                actions.append("CRITICAL: add active Blocking and Isolation rules for " + ", ".join(missing_critical_controls))
             if missing_required_controls_count > 0:
                 actions.extend(_missing_required_control_actions(missing_required_controls))
             if missing_minimum_behavior_controls_count > 0:
@@ -3239,6 +3287,18 @@ def summarize_policy_tuning_analysis(
             "policy_id": pid,
             "policy_name": policy_name_by_id.get(pid, mode_row.get("policy_name", efficacy_row.get("policy_name", "unknown"))),
             "assigned_endpoints": int(assigned_endpoints_by_id.get(pid, 0)),
+            "core_prevention_alert": monitor_rules,
+            "core_prevention_alert_and_block": block_rules,
+            "core_prevention_unknown": unknown_rules,
+            "core_prevention_details": mode_row.get("core_prevention_details", []),
+            "blocking_isolation_rule_counts": {
+                control: _to_int(blocking_counts.get(control, 0)) for control in BASELINE_BLOCKING_CONTROLS
+            },
+            "missing_required_controls": missing_required_controls,
+            "missing_critical_controls": missing_critical_controls,
+            "file_path_rules": policy_path_based_rules,
+            "enforcement_score_0_100": enforcement_score,
+            "severity": "critical" if missing_critical_controls else "high" if tier == "weak" else "none",
             "current_tier": tier,
             "next_target": next_target,
             "actions": actions,
@@ -3250,19 +3310,87 @@ def summarize_policy_tuning_analysis(
     tier_rank = {"weak": 0, "good": 1, "better": 2, "best": 3}
     policy_maturity_all.sort(
         key=lambda row: (
+            0 if row["missing_critical_controls"] else 1,
             tier_rank.get(str(row.get("current_tier", "best")), 3),
+            row["enforcement_score_0_100"],
             -int(row.get("assigned_endpoints", 0)),
             str(row.get("policy_name", "")).lower(),
         )
     )
     policy_maturity_attention = [row for row in policy_maturity_all if bool(row.get("needs_attention", False))]
 
+    maturity_tier_points = {"weak": 60, "good": 85, "better": 95, "best": 100}
+    maturity_tier_counts = {tier: 0 for tier in maturity_tier_points}
+    maturity_scored_rows = [
+        row
+        for row in policy_maturity_all
+        if not use_assigned_scope or _to_int(row.get("assigned_endpoints", 0)) > 0
+    ]
+    for row in maturity_scored_rows:
+        tier = str(row.get("current_tier", "weak")).strip().lower()
+        if tier not in maturity_tier_counts:
+            tier = "weak"
+        maturity_tier_counts[tier] += 1
+
+    maturity_score = (
+        sum(
+            min(maturity_tier_points[row["current_tier"]], row["enforcement_score_0_100"])
+            for row in maturity_scored_rows
+        )
+        / len(maturity_scored_rows)
+        if maturity_scored_rows
+        else 0.0
+    )
+    enforcement_score = (
+        sum(row["enforcement_score_0_100"] for row in maturity_scored_rows) / len(maturity_scored_rows)
+        if maturity_scored_rows else 0.0
+    )
+    gap_score = min(gap_score, int(round(enforcement_score)))
+    score = int(round((gap_score + maturity_score) / 2))
+    good_pass = bool(maturity_scored_rows) and all(row["current_tier"] != "weak" for row in maturity_scored_rows)
+    better_pass = good_pass and all(row["current_tier"] in {"better", "best"} for row in maturity_scored_rows)
+    best_pass = better_pass and all(row["current_tier"] == "best" for row in maturity_scored_rows)
+    current_tier = "best" if best_pass else "better" if better_pass else "good" if good_pass else "weak"
+    critical_count = sum(bool(row["missing_critical_controls"]) for row in maturity_scored_rows)
+    no_path_count = sum(row["file_path_rules"] == 0 for row in maturity_scored_rows)
+    core_gap_count = sum(
+        row["core_prevention_alert"] > 0
+        or row["core_prevention_unknown"] > 0
+        or row["core_prevention_alert_and_block"] == 0
+        for row in maturity_scored_rows
+    )
+    enforcement_gaps: list[str] = []
+    enforcement_actions: list[str] = []
+    if critical_count:
+        enforcement_gaps.append(f"CRITICAL: {critical_count} scored policies lack Known malware or company banned-list enforcement")
+        enforcement_actions.append("Prioritize active Blocking and Isolation rules for Known malware and Application on company banned list")
+    if no_path_count:
+        enforcement_gaps.append(f"{no_path_count} scored policies have no file-path rules and are WEAK")
+        enforcement_actions.append("Add scoped NAME_PATH file-path rules to each policy with none")
+    if core_gap_count:
+        enforcement_gaps.append(f"{core_gap_count} scored policies have Alert-only, unknown/disabled, or missing Core Prevention settings")
+        enforcement_actions.append("Validate Core Prevention on pilot endpoints, then set each setting to Alert and Block")
+    top_gaps = enforcement_gaps + top_gaps
+    next_actions = enforcement_actions + next_actions
+    maturity_tier_percentages = {
+        tier: round((count / len(maturity_scored_rows)) * 100, 1) if maturity_scored_rows else 0.0
+        for tier, count in maturity_tier_counts.items()
+    }
+
     return {
         "framework": "Broadcom Endpoint Standard Good-Better-Best",
         "reference_url": "https://techdocs.broadcom.com/us/en/carbon-black/cloud/cloud-best-practices/index/cbc-tile-bp-tuning-es-policy.html",
         "framework_applicable": True,
         "current_tier": current_tier,
+        "tier_aggregation": "strict_assigned_policy_gates",
         "score_0_100": score,
+        "score_components": {
+            "policy_gap_score": gap_score,
+            "policy_maturity_score": int(round(maturity_score)),
+            "enforcement_score": int(round(enforcement_score)),
+            "weights": {"policy_gaps": 0.5, "policy_maturity": 0.5},
+            "maturity_tier_points": maturity_tier_points,
+        },
         "review_cadence": "quarterly_or_biannual",
         "tier_score_scope": "assigned_policies_only",
         "metrics": {
@@ -3270,9 +3398,14 @@ def summarize_policy_tuning_analysis(
             "total_policies_scored": total_policies_scored,
             "total_policies_all": total_policies_all,
             "assigned_policy_count": len(assigned_policy_ids),
+            "scored_policy_maturity_tier_counts": maturity_tier_counts,
+            "scored_policy_maturity_tier_percentages": maturity_tier_percentages,
             "total_rules": total_rules_scored,
             "total_rules_scored": total_rules_scored,
             "fully_alert_only_policies": fully_alert_only_count,
+            "policies_missing_critical_blocking_controls": critical_count,
+            "policies_without_file_path_rules": no_path_count,
+            "policies_with_core_prevention_gaps": core_gap_count,
             "fully_alert_only_policies_all": fully_alert_only_count_all,
             "policies_with_missing_required_controls": missing_required_count,
             "policies_with_missing_required_controls_all": missing_required_count_all,
@@ -3293,11 +3426,12 @@ def summarize_policy_tuning_analysis(
             "policy_drift_detected": drift_detected,
             "policy_drift_detected_all": drift_detected_all,
             "path_based_policy_rules": path_based_policy_rules,
+            "path_based_policy_rules_all": path_based_policy_rules_all,
         },
         "gates": {
             "good": {
                 "pass": good_pass,
-                "criteria": "No fully alert-only policies, no missing required blocking controls, and no missing GOOD minimum behavior controls",
+                "criteria": "Every scored policy has Core Prevention in Alert and Block, all five baseline Blocking and Isolation categories enforced, at least one NAME_PATH rule, and GOOD minimum behavior controls",
             },
             "better": {
                 "pass": better_pass,
@@ -3305,7 +3439,7 @@ def summarize_policy_tuning_analysis(
             },
             "best": {
                 "pass": best_pass,
-                "criteria": "Better gate plus at least 5 NAME_PATH rules, no P2 BYPASS wildcard issues, no monitor-heavy groups, and no unreviewed drift",
+                "criteria": "Every scored policy passes Better, has at least 5 NAME_PATH rules, no P2 BYPASS wildcard issues, no Alert-only Core Prevention settings, and no unreviewed drift",
             },
         },
         "top_gaps": top_gaps[:6],
@@ -3438,7 +3572,7 @@ def health_score(
             composite_score += policy_maturity_score * policy_maturity_weight
         if watchlist_effectiveness_score is not None and watchlist_effectiveness_weight > 0.0:
             composite_score += watchlist_effectiveness_score * watchlist_effectiveness_weight
-        score = int(round(composite_score))
+        score = int(composite_score + 0.5)
 
         component_notes = [f"{int(round(base_weight * 100))}% operational health ({base_score}/100)"]
         if policy_maturity_score is not None and policy_maturity_weight > 0.0:
@@ -3784,6 +3918,22 @@ def prioritized_recommendations(summary: dict[str, Any]) -> list[dict[str, str]]
             )
 
     if isinstance(policy_tuning, dict) and policy_tuning.get("framework_applicable", False):
+        for policy in policy_tuning.get("policy_maturity_action_plan_all", []):
+            critical = policy.get("missing_critical_controls", [])
+            if critical:
+                recs.append({
+                    "priority": "P1",
+                    "area": "Blocking and Isolation",
+                    "recommendation": "CRITICAL: add active enforcing rules for " + ", ".join(critical),
+                    "evidence": f"policy={policy.get('policy_name', 'unknown')}, missing_critical_controls={len(critical)}",
+                })
+            if policy.get("file_path_rules", 0) == 0:
+                recs.append({
+                    "priority": "P2",
+                    "area": "Policy Tuning",
+                    "recommendation": "Add scoped NAME_PATH file-path rules; a policy with none is WEAK.",
+                    "evidence": f"policy={policy.get('policy_name', 'unknown')}, file_path_rules=0",
+                })
         tier = str(policy_tuning.get("current_tier", "weak"))
         if tier != "best":
             top_gaps = policy_tuning.get("top_gaps", [])

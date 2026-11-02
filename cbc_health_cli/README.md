@@ -39,6 +39,27 @@ The Detailed Breakdown slide classifies enabled or disabled policy rules whose n
 
 The slide reports the number of distinct policies containing at least one matching rule at each priority, not the number of matching rules. A policy can count as both P1 and P2 if it contains rules matching both patterns. These labels are this tool's prioritization heuristic, not Carbon Black Cloud rule severity labels.
 
+## Per-policy enforcement assessment
+
+The technical deck's Detailed Breakdown separates:
+
+- **Core Prevention:** counts of **Alert**, **Alert and Block**, and unknown/disabled settings, assessed per platform. The appendix lists each setting and mode. Alert-only or unverified settings prevent a policy from reaching GOOD.
+- **Blocking and Isolation:** active enforcing rule counts for Known malware, Application on company banned list, Unknown application/process, Adware/PUP, and Suspected malware. These rules do not have an Alert-only mode. Disabled, test-only, or non-enforcing rules do not satisfy coverage.
+- **File paths:** enabled `application.type = NAME_PATH` rules per policy. Zero makes that policy **WEAK**, regardless of other controls; BEST still requires at least five per policy.
+
+Missing Known malware or company banned-list enforcement is **CRITICAL**. The enforcement score deducts 30 points for each of those gaps, 5 for each other missing category, and up to 20 proportionally for non-blocking Core Prevention settings (20 when no settings are available). Zero file-path rules deducts 5 and caps the score at 59; a critical gap caps it at 39. These are tool-specific assessment weights, not vendor severity ratings.
+
+The existing policy-gap score is capped by the average enforcement score, and each policy's maturity contribution is capped by its enforcement score. The existing 50/50 gap/maturity blend is retained. Overall maturity gates require every scored policy to meet the tier; only policies with assigned endpoints affect tenant scoring when policy inventory is supplied. Unassigned policies remain visible in the breakdown and remediation plans. Existing GOOD/BETTER behavior, BYPASS, and drift requirements still apply.
+
+Regenerate assessments from collected policy data before rendering existing reports; old summaries do not contain the new section-specific fields. EEDR-only tenants remain not applicable. A missing Core Prevention response is not inferred from Blocking and Isolation rules.
+
+Run the offline regression tests from this folder (no API calls or credentials):
+
+```powershell
+$env:PYTHONPATH = Join-Path (Get-Location) "src"
+python -m unittest discover -s .\tests -p test_policy_enforcement.py -v
+```
+
 ## Requirements
 
 - Windows 11 laptop with Python 3.10+ installed
