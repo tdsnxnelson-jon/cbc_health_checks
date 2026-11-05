@@ -23,12 +23,15 @@ A Docker-free, Windows-native command line tool to run Carbon Black Cloud health
   - daily alert and threat score trends
   - dormant user login detection
   - sensor coverage quality (stale and unassigned)
+  - sensor release lifecycle reporting with Broadcom's latest release train per OS and detected end-of-support releases
   - alert quality (noise, repeats, unresolved aging)
   - policy efficacy by group (combined standard and core prevention posture)
   - policy tuning analysis (Broadcom Good/Better/Best maturity mapping)
 - Writes outputs to JSON and CSV for easy sharing.
 - Writes a PowerPoint executive summary from `summary.json` for stakeholder sharing.
 - Writes a second technical PowerPoint deck from `summary.json` for engineering review.
+
+The **Endpoint Platform and Sensor Health** slide fetches Broadcom's [sensor lifecycle tables](https://techdocs.broadcom.com/us/en/carbon-black/cloud/carbon-black-cloud-sensors/index/cbc-sensor-life-cycle-support-policy-tile_1/GUID-C6BC4C05-9692-4EBD-AAD0-DABB4946D136-en.html) on every health-check run. EOS/EOL detection uses the vendor release train, while `summary.json` retains the exact detected sensor builds and endpoint counts. Latest values are the vendor's release trains, not full build numbers. If Broadcom's pages cannot be reached or parsed, the report marks lifecycle data unavailable and does not reuse a previous snapshot.
 
 ## BYPASS Rule Priorities
 
@@ -46,6 +49,12 @@ The technical deck's Detailed Breakdown separates:
 - **Core Prevention:** counts of **Alert**, **Alert and Block**, and unknown/disabled settings, assessed per platform. The appendix lists each setting and mode. Alert-only or unverified settings prevent a policy from reaching GOOD.
 - **Blocking and Isolation:** active enforcing rule counts for Known malware, Application on company banned list, Unknown application/process, Adware/PUP, and Suspected malware. These rules do not have an Alert-only mode. Disabled, test-only, or non-enforcing rules do not satisfy coverage.
 - **File paths:** enabled `application.type = NAME_PATH` rules per policy. Zero makes that policy **WEAK**, regardless of other controls; BEST still requires at least five per policy.
+
+Both tables and their appendices include an **Endpoints** column counting all endpoints assigned to each policy, including inactive endpoints, and are sorted by that count descending. The Core Prevention Settings appendix follows the same policy order and includes the count for each setting. Unassigned policies are shown with zero endpoints.
+
+Recommendation appendix tables paginate according to wrapped text height rather than a fixed row count. Long recommendations continue onto additional slides without reducing the font size or dropping text.
+
+On the Alert Analysis slides, Top 10 Policy Rule Blocks and Top 10 Alerted Watchlist Reports include a **Severity** column showing the observed minimum-maximum numeric severity within each group of collected alerts (for example, `3-9`, or `5` when all alerts with a numeric severity have the same value). Ranking remains by alert count. Missing severity data is displayed as `n/a`; older summaries must be reassessed to populate these values.
 
 Missing Known malware or company banned-list enforcement is **CRITICAL**. The enforcement score deducts 30 points for each of those gaps, 5 for each other missing category, and up to 20 proportionally for non-blocking Core Prevention settings (20 when no settings are available). Zero file-path rules deducts 5 and caps the score at 59; a critical gap caps it at 39. These are tool-specific assessment weights, not vendor severity ratings.
 

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from pptx import Presentation
+from pptx.util import Inches
 
 from cbc_health_cli.checks import (
     prioritized_recommendations,
@@ -13,7 +14,7 @@ from cbc_health_cli.checks import (
     summarize_policy_posture,
     summarize_policy_tuning_analysis,
 )
-from cbc_health_cli.reporting import write_executive_pptx, write_technical_pptx
+from cbc_health_cli.reporting import _paginate_table_to_slides, write_executive_pptx, write_technical_pptx
 
 
 def policy_data(policy_id="1", paths=5, assigned=10):
@@ -58,6 +59,35 @@ def assessment(policies, core, rules, ngav=True):
 
 
 class PolicyEnforcementTests(unittest.TestCase):
+    def test_recommendation_appendix_paginates_wrapped_text_without_loss(self):
+        deck = Presentation()
+        deck.slide_width = Inches(13.333)
+        deck.slide_height = Inches(7.5)
+        rows = [
+            ["P1", "Policy coverage", "Preserve every recommendation word. " * 90,
+             "Evidence with explicit lines.\n" * 50],
+            ["P2", "Alerts", "Review alert volume. " * 30, "All evidence is retained."],
+        ]
+        pages = _paginate_table_to_slides(
+            deck, rows, ["Priority", "Area", "Recommendation", "Evidence"], "Complete Recommendations",
+        )
+        self.assertGreater(pages, 1)
+        actual = ["", "", "", ""]
+        for index, slide in enumerate(deck.slides, start=1):
+            self.assertTrue(any(
+                shape.has_text_frame and shape.text == f"Complete Recommendations (Page {index}/{pages})"
+                for shape in slide.shapes
+            ))
+            for shape in slide.shapes:
+                if not shape.has_table:
+                    continue
+                self.assertLessEqual(shape.top + shape.height, Inches(7.1))
+                self.assertLessEqual(shape.left + shape.width, deck.slide_width)
+                for row in list(shape.table.rows)[1:]:
+                    for column, cell in enumerate(row.cells):
+                        actual[column] += cell.text
+        self.assertEqual(actual, ["".join(row[column] for row in rows) for column in range(4)])
+
     def test_complete_policy_is_best(self):
         _, tuning = assessment(*policy_data())
         self.assertEqual(tuning["current_tier"], "best")
@@ -201,11 +231,12 @@ class PolicyEnforcementTests(unittest.TestCase):
     def test_decks_contain_section_specific_tables_and_full_appendices(self):
         policies, core, rules = [], [], []
         for index in range(14):
-            data = policy_data(str(index), paths=0 if index == 0 else 5)
+            data = policy_data(str(index), paths=0 if index == 0 else 5, assigned=index * 10)
             policies.extend(data[0])
             core.extend(data[1])
             rules.extend(data[2])
-        summary, _ = assessment(policies, core, rules)
+        summary, tuning = assessment(policies, core, rules)
+        original_policy_order = [row["policy_id"] for row in tuning["policy_maturity_action_plan_all"]]
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)
             (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
@@ -216,20 +247,53 @@ class PolicyEnforcementTests(unittest.TestCase):
             tables = [shape for shape in slide.shapes if shape.has_table]
             self.assertEqual(len(tables), 2)
             self.assertEqual([cell.text for cell in tables[0].table.rows[0].cells],
-                             ["Policy", "Alert", "Alert and Block", "Unknown"])
-            self.assertEqual(tables[1].table.cell(1, 0).text, "Policy 0")
-            self.assertEqual(tables[1].table.cell(1, 6).text, "0")
-            self.assertIn("WEAK", tables[1].table.cell(1, 7).text)
+                             ["Policy", "Endpoints", "Alert", "Alert and Block", "Unknown"])
+            self.assertEqual(tables[1].table.cell(0, 1).text, "Endpoints")
+            for table in tables:
+                counts = [int(row.cells[1].text) for row in list(table.table.rows)[1:]]
+                self.assertEqual(counts, sorted(counts, reverse=True))
+                self.assertEqual(table.table.cell(1, 0).text, "Policy 13")
+                self.assertEqual(table.table.cell(1, 1).text, "130")
+            self.assertEqual(tables[1].table.cell(1, 7).text, "5")
+            self.assertIn("BEST", tables[1].table.cell(1, 8).text)
             self.assertEqual(len(tables[1].table.rows), 6)
             for table in tables:
                 self.assertLessEqual(table.top + table.height, deck.slide_height)
+            appendix_rows = {
+                "Core Prevention by Policy": [],
+                "Core Prevention Settings": [],
+                "Blocking and Isolation by Policy": [],
+            }
             for page in deck.slides:
+                for title, rows in appendix_rows.items():
+                    if any(shape.has_text_frame and shape.text.startswith(title + " (Page")
+                           for shape in page.shapes):
+                        for shape in page.shapes:
+                            if shape.has_table:
+                                self.assertEqual(shape.table.cell(0, 1).text, "Endpoints")
+                                rows.extend([cell.text for cell in row.cells]
+                                            for row in list(shape.table.rows)[1:])
                 if any(shape.has_text_frame and shape.text.startswith((
                     "Core Prevention Settings (Page", "Blocking and Isolation by Policy (Page",
                 )) for shape in page.shapes):
                     for shape in page.shapes:
                         if shape.has_table:
                             self.assertLessEqual(shape.top + shape.height, deck.slide_height)
+            for title, rows in appendix_rows.items():
+                with self.subTest(appendix=title):
+                    counts = [int(row[1]) for row in rows]
+                    self.assertTrue(counts)
+                    self.assertEqual(counts, sorted(counts, reverse=True))
+                    self.assertEqual(rows[0][:2], ["Policy 13", "130"])
+                    self.assertEqual(rows[-1][:2], ["Policy 0", "0"])
+            self.assertEqual(len(appendix_rows["Core Prevention by Policy"]), 14)
+            self.assertEqual(len(appendix_rows["Blocking and Isolation by Policy"]), 14)
+            weakest_row = appendix_rows["Blocking and Isolation by Policy"][-1]
+            self.assertEqual(weakest_row[7], "0")
+            self.assertIn("WEAK", weakest_row[8])
+            self.assertEqual(
+                [row["policy_id"] for row in tuning["policy_maturity_action_plan_all"]], original_policy_order,
+            )
             all_text = "\n".join(shape.text for page in deck.slides for shape in page.shapes if shape.has_text_frame)
             self.assertIn("Core Prevention Settings (Page", all_text)
             self.assertIn("Blocking and Isolation by Policy (Page 2/", all_text)

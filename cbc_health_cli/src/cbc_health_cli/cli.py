@@ -9,6 +9,7 @@ from typing import Any
 
 from cbc_health_cli.checks import (
     health_score,
+    is_api_connector_authentication_event,
     prioritized_recommendations,
     summarize_alert_quality,
     summarize_alert_workflow,
@@ -30,6 +31,8 @@ from cbc_health_cli.checks import (
     summarize_user_logins_with_users,
     summarize_watchlist_effectiveness,
     summarize_watchlists,
+    SensorLifecycleLookupError,
+    fetch_sensor_lifecycle,
 )
 from cbc_health_cli.client import CBCClient, CredentialsRejectedError
 from cbc_health_cli.config import load_app_config
@@ -643,7 +646,7 @@ def run_command(args: argparse.Namespace) -> int:
                     str(event.get("actor", "")).strip()
                     for event in audit_logs
                     if isinstance(event, dict)
-                    and "connector" in str(event.get("description", "")).lower()
+                    and is_api_connector_authentication_event(event)
                     and str(event.get("actor", "")).strip()
                 }
             )
@@ -724,7 +727,16 @@ def run_command(args: argparse.Namespace) -> int:
     status.advance("Starting sensor coverage quality check")
 
     try:
-        scq = summarize_sensor_coverage_quality(devices)
+        sensor_lifecycle = None
+        try:
+            sensor_lifecycle = fetch_sensor_lifecycle(
+                verify_tls=config.verify_tls,
+                timeout_seconds=config.timeout_seconds,
+            )
+        except SensorLifecycleLookupError as exc:
+            summary["warnings"].append(f"Sensor lifecycle lookup unavailable: {exc}")
+            sensor_lifecycle = {"status": "unavailable", "error": str(exc)}
+        scq = summarize_sensor_coverage_quality(devices, sensor_lifecycle)
         summary["checks"]["sensor_coverage_quality"] = {"status": "ok", "summary": scq}
     except Exception as exc:
         summary["checks"]["sensor_coverage_quality"] = {"status": "error"}

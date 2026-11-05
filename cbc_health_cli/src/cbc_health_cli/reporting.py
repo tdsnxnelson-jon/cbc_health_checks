@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import sys
+import textwrap
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1432,52 +1433,48 @@ def _dormant_recommendation_appendix_data(
     if not isinstance(recommendations, list) or not isinstance(user_logins, dict):
         return None
 
+    # (evidence marker, bucket label, details key, plain list key); legacy markers support older summary.json files.
+    bucket_sources = [
+        ("dormant_60d_plus_count=", "60d+", "dormant_60d_plus_details", "dormant_60d_plus"),
+        ("dormant_30_59d_count=", "30-59d", "dormant_30_59d_details", "dormant_30_59d"),
+        ("never_logged_in_count=", "Never logged in", "users_without_login_events_details", "users_without_login_events"),
+        ("dormant_over_60d_count=", "60d+", "dormant_over_60d_details", "dormant_over_60d"),
+        ("dormant_over_30d_count=", "30d+", "dormant_over_30d_details", "dormant_over_30d"),
+    ]
+    bucket_order = {"60d+": 0, "30-59d": 1, "30d+": 1, "Never logged in": 2}
+
+    rows: list[list[Any]] = []
+    seen_buckets: set[str] = set()
     for rec in recommendations:
         if not isinstance(rec, dict):
             continue
         if str(rec.get("area", "")).strip().lower() != "user logins":
             continue
         evidence = str(rec.get("evidence", ""))
-        if "dormant_over_60d_count=" in evidence:
-            dormant_details = user_logins.get("dormant_over_60d_details", [])
-            if isinstance(dormant_details, list) and len(dormant_details) > 0:
-                rows = [
+        for marker, label, details_key, list_key in bucket_sources:
+            if marker not in evidence or label in seen_buckets:
+                continue
+            seen_buckets.add(label)
+            details = user_logins.get(details_key, [])
+            if isinstance(details, list) and details:
+                rows.extend(
                     [
-                        "60d+",
+                        label,
                         str(item.get("user", "unknown")) if isinstance(item, dict) else str(item),
                         str(item.get("role", "unknown")) if isinstance(item, dict) else "unknown",
                     ]
-                    for item in dormant_details
-                ]
-                rows.sort(key=lambda row: (str(row[2]).lower(), str(row[1]).lower()))
-                return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_details), "Recommendation Dormant Users"
+                    for item in details
+                )
+            else:
+                users = user_logins.get(list_key, [])
+                if isinstance(users, list):
+                    rows.extend([label, str(user), "unknown"] for user in users)
+            break
 
-            dormant_users = user_logins.get("dormant_over_60d", [])
-            if isinstance(dormant_users, list) and len(dormant_users) > 0:
-                rows = [["60d+", user, "unknown"] for user in dormant_users]
-                return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_users), "Recommendation Dormant Users"
-            return None
-        if "dormant_over_30d_count=" in evidence:
-            dormant_details = user_logins.get("dormant_over_30d_details", [])
-            if isinstance(dormant_details, list) and len(dormant_details) > 0:
-                rows = [
-                    [
-                        "30d+",
-                        str(item.get("user", "unknown")) if isinstance(item, dict) else str(item),
-                        str(item.get("role", "unknown")) if isinstance(item, dict) else "unknown",
-                    ]
-                    for item in dormant_details
-                ]
-                rows.sort(key=lambda row: (str(row[2]).lower(), str(row[1]).lower()))
-                return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_details), "Recommendation Dormant Users"
-
-            dormant_users = user_logins.get("dormant_over_30d", [])
-            if isinstance(dormant_users, list) and len(dormant_users) > 0:
-                rows = [["30d+", user, "unknown"] for user in dormant_users]
-                return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_users), "Recommendation Dormant Users"
-            return None
-
-    return None
+    if not rows:
+        return None
+    rows.sort(key=lambda row: (bucket_order.get(str(row[0]), 9), str(row[2]).lower(), str(row[1]).lower()))
+    return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(rows), "Recommendation Dormant Users"
 
 
 def _is_policy_recommendation(rec: dict[str, Any]) -> bool:
@@ -1715,6 +1712,9 @@ def _paginate_table_to_slides(
     if not all_rows:
         return 0
 
+    if headers == ["Priority", "Area", "Recommendation", "Evidence"]:
+        return _paginate_recommendations_to_slides(prs, all_rows, headers, title, rows_per_slide)
+
     slides_created = 0
     for page_idx in range(0, len(all_rows), rows_per_slide):
         slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -1729,6 +1729,64 @@ def _paginate_table_to_slides(
         slides_created += 1
 
     return slides_created
+
+
+def _paginate_recommendations_to_slides(
+    prs: Presentation,
+    all_rows: list[list[Any]],
+    headers: list[str],
+    title: str,
+    rows_per_slide: int,
+) -> int:
+    widths = (0.7, 1.5, 6.0, 4.0)
+    header_height = 0.32
+    line_height = 0.18
+    row_padding = 0.08
+    body_height = 5.8 - header_height
+    max_lines = int((body_height - row_padding) / line_height)
+    pages: list[list[tuple[list[str], float]]] = []
+    page: list[tuple[list[str], float]] = []
+    used_height = 0.0
+    for row in all_rows:
+        wrapped_cells: list[list[str]] = []
+        for value, width in zip(row, widths):
+            # Budget a full 9pt character width, plus cell margins, for conservative wrapping.
+            wrapper = textwrap.TextWrapper(
+                width=max(1, int((width * 72 - 6) / 9)),
+                replace_whitespace=False,
+                drop_whitespace=False,
+            )
+            wrapped_cells.append([
+                line for paragraph in _safe_str(value).splitlines(keepends=True)
+                for line in (wrapper.wrap(paragraph) or [paragraph])
+            ] or [""])
+        line_count = max(len(lines) for lines in wrapped_cells)
+        for start in range(0, line_count, max_lines):
+            chunk_lines = min(max_lines, line_count - start)
+            height = chunk_lines * line_height + row_padding
+            if page and (used_height + height > body_height or len(page) >= rows_per_slide):
+                pages.append(page)
+                page = []
+                used_height = 0.0
+            page.append((["".join(lines[start:start + max_lines]) for lines in wrapped_cells], height))
+            used_height += height
+    if page:
+        pages.append(page)
+
+    for page_number, page in enumerate(pages, start=1):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        _add_background(slide, "FFFFFF")
+        _add_section_header(slide, f"{title} (Page {page_number}/{len(pages)})", "")
+        shape = _add_table(slide, 0.55, 1.3, 12.2, 5.8, headers, [row for row, _ in page])
+        for column, width in zip(shape.table.columns, widths):
+            column.width = Inches(width)
+        shape.table.rows[0].height = Inches(header_height)
+        for table_row, (_, height) in zip(list(shape.table.rows)[1:], page):
+            table_row.height = Inches(height)
+            for cell in table_row.cells:
+                cell.text_frame.word_wrap = True
+        shape.height = sum(row.height for row in shape.table.rows)
+    return len(pages)
 
 
 def _find_slide_by_title_prefix(prs: Presentation, title_prefix: str) -> Any | None:
@@ -2330,7 +2388,11 @@ def write_executive_pptx(run_dir: Path) -> Path:
     _add_card(slide, 10.1, 1.3, 2.55, 1.25, "API Connectors", _format_count(api_connector_use.get("active_connector_count")), f"Dormant {_format_count(api_connector_use.get('dormant_integration_count'))}", accent="0F766E")
 
     _add_card(slide, 0.65, 2.95, 2.9, 1.25, "Banned Hashes", _format_count(banned_hashes.get("older_than_365d")), "older than 365d", accent="B45309")
-    _add_card(slide, 3.8, 2.95, 2.9, 1.25, "User Logins", _format_count(user_logins.get("users_with_login_events")), f"Dormant 30d {_format_count(user_logins.get('dormant_over_30d_count'))}", accent="2563EB")
+    if "dormant_60d_plus_count" in user_logins:
+        dormant_30d_plus = int(_to_numeric(user_logins.get("dormant_30_59d_count", 0)) + _to_numeric(user_logins.get("dormant_60d_plus_count", 0)))
+    else:
+        dormant_30d_plus = int(max(0.0, _to_numeric(user_logins.get("dormant_over_30d_count", 0)) - _to_numeric(user_logins.get("users_without_login_events_count", 0))))
+    _add_card(slide, 3.8, 2.95, 2.9, 1.25, "User Logins", _format_count(user_logins.get("users_with_login_events")), f"Dormant 30d+ {_format_count(dormant_30d_plus)}", accent="2563EB")
     _add_card(slide, 6.95, 2.95, 2.9, 1.25, "Alert Quality", _format_count(alert_quality.get("repeated_detection_keys_over_3")), f"Noise {_format_ratio(alert_quality.get('noise_ratio'))}", accent="DC2626")
     _add_card(slide, 10.1, 2.95, 2.55, 1.25, "Efficacy", _format_count(policy_efficacy.get("total_policy_groups")), "policy groups", accent="111827")
 
@@ -2447,7 +2509,7 @@ def write_executive_pptx(run_dir: Path) -> Path:
             recommendation_footer_y,
             10.8,
             0.18,
-            f"Open appendix for the full list of {total_dormant_users} dormant users.",
+            f"Open appendix for the full list of {total_dormant_users} dormant and never-logged-in users.",
             font_size=8,
             color=_hex_color("2563EB"),
             underline=True,
@@ -2933,10 +2995,11 @@ def write_technical_pptx(run_dir: Path) -> Path:
                 ranking_items = []
                 for label, count in raw_items.items():
                     policy, separator, rule_block = str(label).partition(" | ")
-                    ranking_items.append((policy if separator else "Unknown policy", rule_block if separator else policy, count))
+                    ranking_items.append((policy if separator else "Unknown policy", rule_block if separator else policy, "n/a", count))
             else:
                 ranking_items = [
-                    (str(item.get("policy", "Unknown policy")), str(item.get("rule_block", "")), item.get("count", 0))
+                    (str(item.get("policy", "Unknown policy")), str(item.get("rule_block", "")),
+                     item.get("severity_range", "n/a"), item.get("count", 0))
                     for item in raw_items
                     if isinstance(item, dict)
                 ]
@@ -2947,8 +3010,8 @@ def write_technical_pptx(run_dir: Path) -> Path:
                 width,
                 5.3,
                 ranking_items,
-                column_headers=("Policy", "Rule Block", "Count"),
-                column_widths=(1.55, 3.55, 0.85),
+                column_headers=("Policy", "Rule Block", "Severity", "Count"),
+                column_widths=(1.3, 3.15, 0.8, 0.7),
             )
             continue
         _add_ranking_table(
@@ -2988,6 +3051,16 @@ def write_technical_pptx(run_dir: Path) -> Path:
             bold=True,
             color=_hex_color("102033"),
         )
+        if summary_key == "top_watchlist_reports":
+            severity_ranges = alerts.get("top_watchlist_report_severity_ranges", {})
+            _add_ranking_table(
+                slide, left, table_top, width, table_height,
+                [(report, severity_ranges.get(report, "n/a"), count)
+                 for report, count in _sorted_mapping_items(alerts.get(summary_key, {}), limit=10, sort_by_value=True)],
+                column_headers=("Alert / Report", "Severity", "Count"),
+                column_widths=(width - 1.8, 1.0, 0.8),
+            )
+            continue
         _add_ranking_table(
             slide,
             left,
@@ -3039,7 +3112,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
                 chart_left,
                 2.85,
                 chart_width_adjusted,
-                3.35,
+                2.55,
                 chart_title,
                 [name for name, _ in items],
                 [value for _, value in items],
@@ -3051,7 +3124,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
             chart_left,
             2.85,
             chart_width_adjusted,
-            3.35,
+            2.55,
             chart_title,
             [_truncate_chart_label(name, max_length=20) for name, _ in items],
             [value for _, value in items],
@@ -3059,6 +3132,72 @@ def write_technical_pptx(run_dir: Path) -> Path:
             show_data_labels=False,
             category_font_size=8,
         )
+
+    if sensor_quality.get("sensor_lifecycle_status") == "available":
+        latest_sensor_releases = sensor_quality.get("latest_vendor_release_train_by_os", {})
+        latest_release_text = " | ".join(
+            f"{os_name} {latest_sensor_releases[os_key]}"
+            for os_key, os_name in (("WINDOWS", "Windows"), ("LINUX", "Linux"), ("MACOS", "macOS"))
+            if os_key in latest_sensor_releases
+        )
+        _add_textbox(
+            slide,
+            0.65,
+            5.55,
+            12.05,
+            0.24,
+            f"Latest vendor release train: {latest_release_text or 'n/a'}",
+            font_size=10,
+            bold=True,
+            color=_hex_color("102033"),
+        )
+
+        eos_releases_by_os = sensor_quality.get("eos_sensor_release_train_breakdown_by_os", {})
+        eos_summary = []
+        for os_key, os_name in (("WINDOWS", "Windows"), ("LINUX", "Linux"), ("MACOS", "macOS")):
+            release_counts = eos_releases_by_os.get(os_key, {})
+            releases_text = ", ".join(
+                f"{release}.x ({count})"
+                for release, count in sorted(
+                    release_counts.items(),
+                    key=lambda item: tuple(int(part) for part in item[0].split(".")),
+                    reverse=True,
+                )
+            ) or "none detected"
+            eos_summary.append(f"{os_name}: {releases_text}")
+        eos_text = "End-of-support (EOS/EOL) release trains detected: " + " | ".join(eos_summary)
+    else:
+        eos_text = "Broadcom lifecycle data unavailable; EOS/EOL was not assessed for this run."
+    _add_textbox(
+        slide,
+        0.65,
+        5.83,
+        12.05,
+        0.48,
+        eos_text,
+        font_size=9,
+        color=_hex_color("334155"),
+    )
+    lifecycle_source = sensor_quality.get("sensor_lifecycle_source")
+    lifecycle_retrieved_at = sensor_quality.get("sensor_lifecycle_retrieved_at")
+    source_label = (
+        f"Broadcom lifecycle reference fetched {lifecycle_retrieved_at}"
+        if lifecycle_retrieved_at
+        else "Broadcom sensor lifecycle source"
+    )
+    source_textbox = _add_textbox(
+        slide,
+        0.65,
+        6.34,
+        12.05,
+        0.18,
+        source_label,
+        font_size=8,
+        color=_hex_color("2563EB"),
+        underline=True,
+    )
+    if lifecycle_source and source_textbox.text_frame.paragraphs[0].runs:
+        source_textbox.text_frame.paragraphs[0].runs[0].hyperlink.address = str(lifecycle_source)
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "FFFFFF")
@@ -3335,19 +3474,27 @@ def write_technical_pptx(run_dir: Path) -> Path:
     )
 
     if isinstance(user_logins, dict):
-        dormant_7d = _to_numeric(user_logins.get("dormant_over_7d_count", 0))
-        dormant_30d = _to_numeric(user_logins.get("dormant_over_30d_count", 0))
-        dormant_60d = _to_numeric(user_logins.get("dormant_over_60d_count", 0))
         never_logged_in = _to_numeric(user_logins.get("users_without_login_events_count", 0))
+        if "dormant_60d_plus_count" in user_logins:
+            dormant_counts = {
+                "7-29d": _to_numeric(user_logins.get("dormant_7_29d_count", 0)),
+                "30-59d": _to_numeric(user_logins.get("dormant_30_59d_count", 0)),
+                "60d+": _to_numeric(user_logins.get("dormant_60d_plus_count", 0)),
+                "Never logged in": never_logged_in,
+            }
+        else:
+            # Legacy summaries stored cumulative "over N days" counts that also included never-logged-in users.
+            dormant_7d = _to_numeric(user_logins.get("dormant_over_7d_count", 0))
+            dormant_30d = _to_numeric(user_logins.get("dormant_over_30d_count", 0))
+            dormant_60d = _to_numeric(user_logins.get("dormant_over_60d_count", 0))
+            dormant_counts = {
+                "7-29d": max(0.0, dormant_7d - dormant_30d),
+                "30-59d": max(0.0, dormant_30d - dormant_60d),
+                "60d+": max(0.0, dormant_60d - never_logged_in),
+                "Never logged in": never_logged_in,
+            }
     else:
-        dormant_7d = dormant_30d = dormant_60d = never_logged_in = 0.0
-
-    dormant_counts = {
-        "7-29d": max(0.0, dormant_7d - dormant_30d),
-        "30-59d": max(0.0, dormant_30d - dormant_60d),
-        "60d+": max(0.0, dormant_60d - never_logged_in),
-        "Never logged in": never_logged_in,
-    }
+        dormant_counts = {"7-29d": 0.0, "30-59d": 0.0, "60d+": 0.0, "Never logged in": 0.0}
     dormant_items = list(dormant_counts.items())
     _add_column_chart(
         slide,
@@ -3515,7 +3662,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "F8FAFC")
-    _add_section_header(slide, "Detailed Breakdown", "Core Prevention modes and Blocking and Isolation coverage, with weakest policies first.")
+    _add_section_header(slide, "Detailed Breakdown", "Core Prevention modes and Blocking and Isolation coverage, ordered by assigned endpoints (descending).")
     risk_metric_data = {
         "Old banned hashes": _to_numeric(banned_hashes.get("older_than_365d", 0)),
         "Bypass rules": _to_numeric(permissions_rule_audit.get("bypass_rules", 0)),
@@ -3545,10 +3692,11 @@ def write_technical_pptx(run_dir: Path) -> Path:
         if isinstance(item, dict) and "enforcement_score_0_100" in item
         and "blocking_isolation_rule_counts" in item and "core_prevention_alert" in item
     ] if blocking_applicable else []
-    core_headers = ["Policy", "Alert", "Alert and Block", "Unknown"]
-    blocking_headers = ["Policy", "Known\nmalware", "Banned\nlist", "Unknown\napp", "Adware/\nPUP", "Suspected\nmalware", "File\npaths", "Assessment"]
+    policy_breakdown.sort(key=lambda item: -_to_numeric(item.get("assigned_endpoints", 0)))
+    core_headers = ["Policy", "Endpoints", "Alert", "Alert and Block", "Unknown"]
+    blocking_headers = ["Policy", "Endpoints", "Known\nmalware", "Banned\nlist", "Unknown\napp", "Adware/\nPUP", "Suspected\nmalware", "File\npaths", "Assessment"]
     core_rows = [
-        [item.get("policy_name", "unknown"), item.get("core_prevention_alert", 0),
+        [item.get("policy_name", "unknown"), item.get("assigned_endpoints", 0), item.get("core_prevention_alert", 0),
          item.get("core_prevention_alert_and_block", 0), item.get("core_prevention_unknown", 0)]
         for item in policy_breakdown if isinstance(item, dict)
     ]
@@ -3563,6 +3711,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
             assessment = "CRITICAL / " + assessment
         blocking_rows.append([
             item.get("policy_name", "unknown"),
+            item.get("assigned_endpoints", 0),
             *[counts.get(control, 0) for control in (
                 "known_malware", "company_banned_list", "unknown_application", "adware_pup", "suspected_malware"
             )],
@@ -3571,7 +3720,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
         ])
         for detail in item.get("core_prevention_details", []):
             core_detail_rows.append([
-                item.get("policy_name", "unknown"), detail.get("name", "unknown"),
+                item.get("policy_name", "unknown"), item.get("assigned_endpoints", 0), detail.get("name", "unknown"),
                 detail.get("platform", "unknown"), detail.get("mode", "unknown"),
             ])
 
@@ -3581,11 +3730,11 @@ def write_technical_pptx(run_dir: Path) -> Path:
         _add_textbox(slide, 5.0, 1.12, 7.7, 0.22, "Core Prevention - settings per platform", font_size=11)
         _add_table(
             slide, 5.0, 1.4, 7.7, 2.25, core_headers,
-            core_rows[:TECH_CORE_PREVENTION_ROWS_ON_SLIDE] or [["No policy assessment data; rerun checks", "-", "-", "-"]],
+            core_rows[:TECH_CORE_PREVENTION_ROWS_ON_SLIDE] or [["No policy assessment data; rerun checks", "-", "-", "-", "-"]],
         )
         _queue_appendix_table(core_rows, core_headers, "Core Prevention by Policy")
         _queue_appendix_table(
-            core_detail_rows, ["Policy", "Setting\nname", "Platform", "Mode"],
+            core_detail_rows, ["Policy", "Endpoints", "Setting\nname", "Platform", "Mode"],
             "Core Prevention Settings", rows_per_slide=12,
         )
         if core_rows:
@@ -3616,7 +3765,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
     else:
         _add_table(
             slide, 0.65, 4.0, 12.0, 2.55, blocking_headers,
-            policy_rows_on_slide or [["No policy assessment data; rerun checks", "-", "-", "-", "-", "-", "-", "Unknown"]],
+            policy_rows_on_slide or [["No policy assessment data; rerun checks", "-", "-", "-", "-", "-", "-", "-", "Unknown"]],
         )
     
     policy_footnote = _add_sampling_footnote(slide, total_policies, shown_policies, y_position=6.73)
@@ -3688,7 +3837,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
             recommendation_footer_y_tech,
             10.8,
             0.18,
-            f"Open appendix for the full list of {total_dormant_users} dormant users.",
+            f"Open appendix for the full list of {total_dormant_users} dormant and never-logged-in users.",
             font_size=8,
             color=_hex_color("2563EB"),
             underline=True,

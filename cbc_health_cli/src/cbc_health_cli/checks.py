@@ -3,10 +3,14 @@ from __future__ import annotations
 import ast
 import json
 import re
+import ssl
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
 from statistics import median
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import requests as _requests
 
@@ -576,6 +580,15 @@ def summarize_alerts(
     intrusion_detection_counter: Counter[str] = Counter()
     core_prevention_counter: Counter[str] = Counter()
     watchlist_report_counter: Counter[str] = Counter()
+    policy_rule_severities: dict[tuple[str, str], set[int]] = {}
+    watchlist_report_severities: dict[str, set[int]] = {}
+
+    def severity_range(values: set[int]) -> str:
+        if not values:
+            return "n/a"
+        minimum, maximum = min(values), max(values)
+        return str(minimum) if minimum == maximum else f"{minimum}-{maximum}"
+
     core_prevention_names = (
         "Advanced Scripting Prevention",
         "Carbon Black Threat Intel",
@@ -587,6 +600,7 @@ def summarize_alerts(
 
     for a in alerts:
         sev = str(_pick_value(a, ["severity", "threat_score", "impact_score"], "unknown"))
+        numeric_severity = int(sev) if sev.isascii() and sev.isdigit() else None
         atype = str(_pick_value(a, ["type", "category", "alert_type"], "unknown"))
         severity_counter[sev] += 1
         type_counter[atype] += 1
@@ -617,6 +631,8 @@ def summarize_alerts(
             if not rule_name:
                 rule_name = _display_cb_analytics_rule_fallback(reason)
             cb_analytics_policy_rule_counter[(policy_label, rule_name)] += 1
+            if numeric_severity is not None:
+                policy_rule_severities.setdefault((policy_label, rule_name), set()).add(numeric_severity)
 
         core_rule_name = (core_prevention_rule_names or {}).get((rule_category_id, rule_id), "")
         if core_rule_name in core_prevention_names:
@@ -636,6 +652,8 @@ def summarize_alerts(
                     report_name = report_match.group(1).strip()
             if report_name:
                 watchlist_report_counter[report_name] += 1
+                if numeric_severity is not None:
+                    watchlist_report_severities.setdefault(report_name, set()).add(numeric_severity)
 
         for technique in _extract_alert_attack_techniques(a):
             attack_technique_counter[technique] += 1
@@ -660,12 +678,21 @@ def summarize_alerts(
         "top_alerted_policies": dict(alerted_policy_counter.most_common(10)),
         "top_cb_analytics_alert_types": dict(cb_analytics_reason_counter.most_common(10)),
         "top_cb_analytics_policy_rule_blocks": [
-            {"policy": policy, "rule_block": rule_block, "count": count}
+            {
+                "policy": policy,
+                "rule_block": rule_block,
+                "severity_range": severity_range(policy_rule_severities.get((policy, rule_block), set())),
+                "count": count,
+            }
             for (policy, rule_block), count in cb_analytics_policy_rule_counter.most_common(10)
         ],
         "top_intrusion_detection_alerts": dict(intrusion_detection_counter.most_common(10)),
         "top_core_prevention_alert_rules": dict(core_prevention_counter.most_common(10)),
         "top_watchlist_reports": dict(watchlist_report_counter.most_common(10)),
+        "top_watchlist_report_severity_ranges": {
+            report: severity_range(watchlist_report_severities.get(report, set()))
+            for report, _ in watchlist_report_counter.most_common(10)
+        },
     }
 
 
@@ -1655,6 +1682,19 @@ def _enrich_ips(ips: list[str]) -> dict[str, dict[str, str | None]]:
     return result
 
 
+def is_api_connector_authentication_event(event: dict[str, Any]) -> bool:
+    description = str(event.get("description", "")).strip()
+    if not re.fullmatch(
+        r"Connector \(App\) .+ created session successfully",
+        description,
+        flags=re.IGNORECASE,
+    ):
+        return False
+
+    connector_id = str(_pick_value(event, ["actor", "api_key_id", "access_key", "principal"], "")).strip()
+    return bool(connector_id and "@" not in connector_id)
+
+
 def summarize_api_connector_use(
     audit_logs: list[dict[str, Any]],
     api_access_keys: list[dict[str, Any]] | None = None,
@@ -1695,11 +1735,9 @@ def summarize_api_connector_use(
     connector_events: list[dict[str, Any]] = []
 
     for event in audit_logs:
-        description = str(event.get("description", ""))
-        # Only count entries that represent connector authentication sessions
-        if "Connector" not in description and "connector" not in description:
+        if not is_api_connector_authentication_event(event):
             continue
-
+        description = str(event.get("description", ""))
         connector_id = str(_pick_value(event, ["actor", "api_key_id", "access_key", "principal"], "unknown")).strip()
         connector_sessions[connector_id] += 1
         access_level_type = api_access_type_by_id.get(connector_id, "")
@@ -1735,7 +1773,7 @@ def summarize_api_connector_use(
         connector_session_events = 0
 
         for connector_id, metrics in connector_activity.items():
-            if not isinstance(metrics, dict):
+            if not isinstance(metrics, dict) or "@" in connector_id:
                 continue
             session_count = int(metrics.get("session_count", 0) or 0)
             if session_count <= 0:
@@ -2582,6 +2620,7 @@ def summarize_user_logins_with_users(
 
     users_to_evaluate = known_users if known_users else set(last_login_by_user.keys())
 
+    # Mutually exclusive buckets: each user lands in at most one bucket.
     dormant_7 = []
     dormant_30 = []
     dormant_60 = []
@@ -2590,17 +2629,14 @@ def summarize_user_logins_with_users(
         ts = last_login_by_user.get(user)
         if ts is None:
             never_logged_in.append(user)
-            dormant_7.append(user)
-            dormant_30.append(user)
-            dormant_60.append(user)
             continue
         age_days = (now - ts).days
-        if age_days >= 7:
-            dormant_7.append(user)
-        if age_days >= 30:
-            dormant_30.append(user)
         if age_days >= 60:
             dormant_60.append(user)
+        elif age_days >= 30:
+            dormant_30.append(user)
+        elif age_days >= 7:
+            dormant_7.append(user)
 
     user_login_details = []
     for user in sorted(last_login_by_user.keys()):
@@ -2629,19 +2665,206 @@ def summarize_user_logins_with_users(
         ],
         "users_without_login_events_count": len(never_logged_in),
         "user_login_details": user_login_details,
-        "dormant_over_7d": dormant_7_sorted,
-        "dormant_over_30d": dormant_30_sorted,
-        "dormant_over_60d": dormant_60_sorted,
-        "dormant_over_7d_details": [{"user": user, "role": _user_role(user)} for user in dormant_7_sorted],
-        "dormant_over_30d_details": [{"user": user, "role": _user_role(user)} for user in dormant_30_sorted],
-        "dormant_over_60d_details": [{"user": user, "role": _user_role(user)} for user in dormant_60_sorted],
-        "dormant_over_7d_count": len(dormant_7),
-        "dormant_over_30d_count": len(dormant_30),
-        "dormant_over_60d_count": len(dormant_60),
+        "dormant_7_29d": dormant_7_sorted,
+        "dormant_30_59d": dormant_30_sorted,
+        "dormant_60d_plus": dormant_60_sorted,
+        "dormant_7_29d_details": [{"user": user, "role": _user_role(user)} for user in dormant_7_sorted],
+        "dormant_30_59d_details": [{"user": user, "role": _user_role(user)} for user in dormant_30_sorted],
+        "dormant_60d_plus_details": [{"user": user, "role": _user_role(user)} for user in dormant_60_sorted],
+        "dormant_7_29d_count": len(dormant_7),
+        "dormant_30_59d_count": len(dormant_30),
+        "dormant_60d_plus_count": len(dormant_60),
     }
 
 
-def summarize_sensor_coverage_quality(devices: list[dict[str, Any]]) -> dict[str, Any]:
+_SENSOR_LIFECYCLE_SOURCE = (
+    "https://techdocs.broadcom.com/us/en/carbon-black/cloud/carbon-black-cloud-sensors/"
+    "index/cbc-sensor-life-cycle-support-policy-tile_1/"
+    "GUID-C6BC4C05-9692-4EBD-AAD0-DABB4946D136-en.html"
+)
+_SENSOR_LIFECYCLE_PAGES = {
+    "WINDOWS": (
+        "Windows",
+        "https://techdocs.broadcom.com/us/en/carbon-black/cloud/carbon-black-cloud-sensors/"
+        "index/cbc-sensor_oers/cbc-windows-sensor--on-windows-desktop--oer-tile/"
+        "GUID-6197EE6C-3CCD-4F4B-9DCD-110804251ACC-en.html",
+    ),
+    "LINUX": (
+        "Linux",
+        "https://techdocs.broadcom.com/us/en/carbon-black/cloud/carbon-black-cloud-sensors/"
+        "index/cbc-sensor_oers/cbc-linux-sensor-oer-tile/"
+        "GUID-8A478FFF-656E-46EC-8904-50BD08DA542A-en.html",
+    ),
+    "MACOS": (
+        "macOS",
+        "https://techdocs.broadcom.com/us/en/carbon-black/cloud/carbon-black-cloud-sensors/"
+        "index/cbc-sensor_oers/cbc-macos-sensor-oer-tile/"
+        "GUID-D4E1F76A-DDBA-43E2-A651-DFB7ACBAF621-en.html",
+    ),
+}
+
+
+class SensorLifecycleLookupError(RuntimeError):
+    pass
+
+
+class _SensorLifecycleTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[dict[str, Any]] = []
+        self._table: dict[str, Any] | None = None
+        self._row: list[str] | None = None
+        self._cell_parts: list[str] | None = None
+        self._caption_parts: list[str] | None = None
+
+    def handle_starttag(self, tag: str, _attrs: list[tuple[str, str | None]]) -> None:
+        _ = _attrs
+        if tag == "table":
+            self._table = {"caption": "", "rows": []}
+        elif tag == "caption" and self._table is not None:
+            self._caption_parts = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in {"th", "td"} and self._row is not None:
+            self._cell_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._cell_parts is not None:
+            self._cell_parts.append(data)
+        elif self._caption_parts is not None:
+            self._caption_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"th", "td"} and self._cell_parts is not None and self._row is not None:
+            self._row.append(" ".join("".join(self._cell_parts).split()))
+            self._cell_parts = None
+        elif tag == "caption" and self._caption_parts is not None and self._table is not None:
+            self._table["caption"] = " ".join("".join(self._caption_parts).split())
+            self._caption_parts = None
+        elif tag == "tr" and self._row is not None and self._table is not None:
+            self._table["rows"].append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            self.tables.append(self._table)
+            self._table = None
+
+
+def _sensor_release_parts(release: str) -> tuple[int, ...] | None:
+    match = re.match(r"^\s*(\d+(?:\.\d+)+)(?:[.-].*)?\s*$", release)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _sensor_release_train(sensor_version: str) -> tuple[int, int] | None:
+    parts = _sensor_release_parts(sensor_version)
+    if not parts or len(parts) < 2:
+        return None
+    return parts[0], parts[1]
+
+
+def _sensor_eos_date_passed(value: str, today: date) -> bool:
+    match = re.fullmatch(r"\s*([A-Za-z]+)\s+(\d{4})\s*", value)
+    if not match:
+        return False
+    try:
+        release_month = datetime.strptime(match.group(1), "%B").month
+    except ValueError:
+        return False
+    release_year = int(match.group(2))
+    return (release_year, release_month) <= (today.year, today.month)
+
+
+def _parse_sensor_lifecycle_page(
+    html: str,
+    os_label: str,
+    *,
+    today: date,
+) -> tuple[str, set[tuple[int, int]]]:
+    parser = _SensorLifecycleTableParser()
+    parser.feed(html)
+    standard_releases: list[tuple[tuple[int, ...], str]] = []
+    eos_release_trains: set[tuple[int, int]] = set()
+    expected_caption = f"{os_label} Sensors in Status: "
+    found_standard_table = False
+
+    for table in parser.tables:
+        caption = table["caption"]
+        if not caption.startswith(expected_caption):
+            continue
+        status_name = caption.removeprefix(expected_caption)
+        if status_name == "Standard Support":
+            found_standard_table = True
+        for row in table["rows"]:
+            if len(row) < 4:
+                continue
+            release_parts = _sensor_release_parts(row[0])
+            if not release_parts:
+                continue
+            release_train = (release_parts[0], release_parts[1])
+            if status_name == "Standard Support":
+                standard_releases.append((release_parts, row[0]))
+            if _sensor_eos_date_passed(row[3], today):
+                eos_release_trains.add(release_train)
+
+    if not found_standard_table or not standard_releases:
+        raise SensorLifecycleLookupError(
+            f"Broadcom {os_label} lifecycle page did not contain its Standard Support release table."
+        )
+    latest_release = max(standard_releases, key=lambda release: release[0])[1]
+    return latest_release, eos_release_trains
+
+
+def fetch_sensor_lifecycle(*, verify_tls: bool = True, timeout_seconds: int = 15) -> dict[str, Any]:
+    """Fetch current per-OS release and EOS data from Broadcom for this run."""
+    latest_release_by_os: dict[str, str] = {}
+    eos_release_trains_by_os: dict[str, set[tuple[int, int]]] = {}
+    ssl_context = None
+    if not verify_tls:
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+    for os_key, (os_label, url) in _SENSOR_LIFECYCLE_PAGES.items():
+        try:
+            request = Request(url, headers={"Cache-Control": "no-cache"})
+            with urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
+                page = response.read().decode(response.headers.get_content_charset() or "utf-8")
+        except (URLError, TimeoutError, OSError) as exc:
+            raise SensorLifecycleLookupError(
+                f"Could not retrieve Broadcom {os_label} sensor lifecycle data: {exc}"
+            ) from exc
+        latest_release, eos_release_trains = _parse_sensor_lifecycle_page(
+            page,
+            os_label,
+            today=date.today(),
+        )
+        latest_release_by_os[os_key] = latest_release
+        eos_release_trains_by_os[os_key] = eos_release_trains
+
+    return {
+        "status": "available",
+        "source": _SENSOR_LIFECYCLE_SOURCE,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "latest_release_train_by_os": latest_release_by_os,
+        "eos_release_trains_by_os": eos_release_trains_by_os,
+    }
+
+
+def _sensor_os_family(os_name: str) -> str | None:
+    os_token = os_name.strip().casefold()
+    if "win" in os_token:
+        return "WINDOWS"
+    if "mac" in os_token or "darwin" in os_token:
+        return "MACOS"
+    if "linux" in os_token:
+        return "LINUX"
+    return None
+
+
+def summarize_sensor_coverage_quality(
+    devices: list[dict[str, Any]],
+    sensor_lifecycle: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     counted_devices = _filter_counted_devices(devices)
     now = datetime.now(timezone.utc)
     stale_sensors = 0
@@ -2649,12 +2872,22 @@ def summarize_sensor_coverage_quality(devices: list[dict[str, Any]]) -> dict[str
     stale_version_counts: Counter[str] = Counter()
     version_counts_by_os: dict[str, Counter[str]] = defaultdict(Counter)
     stale_version_counts_by_os: dict[str, Counter[str]] = defaultdict(Counter)
+    eos_release_trains_by_os = (sensor_lifecycle or {}).get("eos_release_trains_by_os", {})
+    eos_version_counts_by_os: dict[str, Counter[str]] = defaultdict(Counter)
+    eos_release_train_counts_by_os: dict[str, Counter[str]] = defaultdict(Counter)
 
     for device in counted_devices:
         os_name = str(_pick_value(device, ["os", "os_name", "platform"], "unknown")).strip().upper() or "UNKNOWN"
         sensor_version = str(_pick_value(device, ["sensor_version", "agent_version", "version"], "unknown")).strip() or "unknown"
         version_counts[sensor_version] += 1
         version_counts_by_os[os_name][sensor_version] += 1
+
+        os_family = _sensor_os_family(os_name)
+        release_train = _sensor_release_train(sensor_version)
+        eos_release_trains = eos_release_trains_by_os.get(os_family or "", set())
+        if os_family and release_train and release_train in eos_release_trains:
+            eos_version_counts_by_os[os_family][sensor_version] += 1
+            eos_release_train_counts_by_os[os_family][f"{release_train[0]}.{release_train[1]}"] += 1
 
         last_contact = _to_dt(_pick_value(device, ["last_contact_time", "last_contact", "last_seen_time"]))
         if not last_contact or (now - last_contact) >= timedelta(days=7):
@@ -2670,6 +2903,18 @@ def summarize_sensor_coverage_quality(devices: list[dict[str, Any]]) -> dict[str
         os_name: dict(version_counter.most_common())
         for os_name, version_counter in sorted(stale_version_counts_by_os.items(), key=lambda item: item[0])
     }
+    eos_sensor_version_breakdown_by_os = {
+        os_name: dict(version_counter.most_common())
+        for os_name, version_counter in sorted(eos_version_counts_by_os.items(), key=lambda item: item[0])
+    }
+    eos_sensor_release_train_breakdown_by_os = {
+        os_name: dict(sorted(
+            version_counter.items(),
+            key=lambda item: _sensor_release_train(item[0]) or (0, 0),
+            reverse=True,
+        ))
+        for os_name, version_counter in sorted(eos_release_train_counts_by_os.items(), key=lambda item: item[0])
+    }
 
     return {
         "total_devices": len(counted_devices),
@@ -2678,6 +2923,13 @@ def summarize_sensor_coverage_quality(devices: list[dict[str, Any]]) -> dict[str
         "stale_sensor_version_breakdown": dict(stale_version_counts.most_common()),
         "sensor_version_breakdown_by_os": sensor_version_breakdown_by_os,
         "stale_sensor_version_breakdown_by_os": stale_sensor_version_breakdown_by_os,
+        "sensor_lifecycle_status": (sensor_lifecycle or {}).get("status", "unavailable"),
+        "latest_vendor_release_train_by_os": (sensor_lifecycle or {}).get("latest_release_train_by_os", {}),
+        "eos_sensor_version_breakdown_by_os": eos_sensor_version_breakdown_by_os,
+        "eos_sensor_release_train_breakdown_by_os": eos_sensor_release_train_breakdown_by_os,
+        "sensor_lifecycle_source": (sensor_lifecycle or {}).get("source", _SENSOR_LIFECYCLE_SOURCE),
+        "sensor_lifecycle_retrieved_at": (sensor_lifecycle or {}).get("retrieved_at"),
+        "sensor_lifecycle_error": (sensor_lifecycle or {}).get("error"),
     }
 
 
@@ -3808,50 +4060,47 @@ def prioritized_recommendations(summary: dict[str, Any]) -> list[dict[str, str]]
             }
         )
 
-    dormant_60d_count = int(user_logins.get("dormant_over_60d_count", 0))
-    dormant_30d_count = int(user_logins.get("dormant_over_30d_count", 0))
-    if dormant_60d_count > 0:
-        user_details = user_logins.get("dormant_over_60d_details", [])
+    def _user_sample(details_key: str, list_key: str) -> str:
+        user_details = user_logins.get(details_key, [])
         if isinstance(user_details, list) and user_details:
-            sample_details = user_details[:5]
             names = [
                 f"{str(item.get('user', 'unknown'))} ({str(item.get('role', 'unknown'))})"
-                for item in sample_details
+                for item in user_details[:5]
                 if isinstance(item, dict)
             ]
-            names_str = ", ".join(names) + (" ..." if len(user_details) > 5 else "")
-        else:
-            users = user_logins.get("dormant_over_60d", [])
-            names = users[:5] if isinstance(users, list) else []
-            names_str = ", ".join(names) + (" ..." if isinstance(users, list) and len(users) > 5 else "")
+            return ", ".join(names) + (" ..." if len(user_details) > 5 else "")
+        users = user_logins.get(list_key, [])
+        names = [str(u) for u in users[:5]] if isinstance(users, list) else []
+        return ", ".join(names) + (" ..." if isinstance(users, list) and len(users) > 5 else "")
+
+    dormant_60d_count = int(user_logins.get("dormant_60d_plus_count", 0))
+    dormant_30d_count = int(user_logins.get("dormant_30_59d_count", 0))
+    never_logged_in_count = int(user_logins.get("users_without_login_events_count", 0))
+    if dormant_60d_count > 0:
         recs.append(
             {
                 "priority": "P1",
                 "area": "User Logins",
                 "recommendation": "Investigate users dormant for 60+ days and remove or disable unnecessary access.",
-                "evidence": f"dormant_over_60d_count={dormant_60d_count}, users={names_str}",
+                "evidence": f"dormant_60d_plus_count={dormant_60d_count}, users={_user_sample('dormant_60d_plus_details', 'dormant_60d_plus')}",
             }
         )
-    elif dormant_30d_count > 0:
-        user_details = user_logins.get("dormant_over_30d_details", [])
-        if isinstance(user_details, list) and user_details:
-            sample_details = user_details[:5]
-            names = [
-                f"{str(item.get('user', 'unknown'))} ({str(item.get('role', 'unknown'))})"
-                for item in sample_details
-                if isinstance(item, dict)
-            ]
-            names_str = ", ".join(names) + (" ..." if len(user_details) > 5 else "")
-        else:
-            users = user_logins.get("dormant_over_30d", [])
-            names = users[:5] if isinstance(users, list) else []
-            names_str = ", ".join(names) + (" ..." if isinstance(users, list) and len(users) > 5 else "")
+    if dormant_30d_count > 0:
         recs.append(
             {
                 "priority": "P2",
                 "area": "User Logins",
-                "recommendation": "Review users dormant for 30+ days and validate if access is still required.",
-                "evidence": f"dormant_over_30d_count={dormant_30d_count}, users={names_str}",
+                "recommendation": "Review users dormant for 30-59 days and validate if access is still required.",
+                "evidence": f"dormant_30_59d_count={dormant_30d_count}, users={_user_sample('dormant_30_59d_details', 'dormant_30_59d')}",
+            }
+        )
+    if never_logged_in_count > 0:
+        recs.append(
+            {
+                "priority": "P2",
+                "area": "User Logins",
+                "recommendation": "Review users who have never logged in and remove or disable accounts that are not required.",
+                "evidence": f"never_logged_in_count={never_logged_in_count}, users={_user_sample('users_without_login_events_details', 'users_without_login_events')}",
             }
         )
 
